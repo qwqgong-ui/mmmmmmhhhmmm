@@ -2,6 +2,7 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +231,16 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
 			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
-			_, _ = p.URLTest(ctx, url, expectedStatus)
+			wasAlive := p.AliveForTestUrl(url)
+			_, probeErr := p.URLTest(ctx, url, expectedStatus)
+			isAlive := p.AliveForTestUrl(url)
+			if wasAlive != isAlive {
+				reason := "probe_succeeded"
+				if probeErr != nil {
+					reason = probeErr.Error()
+				}
+				log.Fields(log.INFO, map[string]string{"subsystem": "provider", "event": "health_changed", "proxy": p.Name(), "reason": reason, "healthy": fmt.Sprint(isAlive), "latency_ms": fmt.Sprint(p.LastDelayForTestUrl(url))}, "Provider proxy health changed: %s healthy=%t", p.Name(), isAlive)
+			}
 			log.Debugln("Health Checked, proxy: %s, url: %s, alive: %t, delay: %d ms uid: {%s}", p.Name(), url, p.AliveForTestUrl(url), p.LastDelayForTestUrl(url), uid)
 			return nil
 		})

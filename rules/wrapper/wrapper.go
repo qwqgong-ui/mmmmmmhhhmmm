@@ -77,6 +77,9 @@ func (r *RuleWrapper) Match(metadata *C.Metadata, helper C.RuleMatchHelper) (boo
 		return false, ""
 	}
 	ok, adapter := r.Rule.Match(metadata, helper)
+	if helper.Diagnostic {
+		return ok, adapter
+	}
 	if ok {
 		r.Hit()
 	} else {

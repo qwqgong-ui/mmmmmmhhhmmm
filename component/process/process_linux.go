@@ -19,6 +19,8 @@ import (
 	"unicode"
 	"unsafe"
 
+	"github.com/metacubex/mihomo/log"
+
 	"github.com/mdlayher/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -319,6 +321,18 @@ func resolveSocketByNetlink(network string, ip netip.Addr, srcPort int) (uint32,
 }
 
 func resolveProcessNameByProcSearch(inode, uid uint32, matcher ProcessMatcher) (string, error) {
+	debug := log.Enabled(log.DEBUG)
+	candidates, fdScans := 0, 0
+	finalPID := ""
+	if debug {
+		defer func() {
+			reason := "socket_inode_not_found"
+			if finalPID != "" {
+				reason = "socket_inode_matched"
+			}
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "process", "event": "pid_filter", "candidate_count": strconv.Itoa(candidates), "fd_filter_count": strconv.Itoa(fdScans), "pid": finalPID, "reason": reason}, "Process uid=%d inode=%d candidate PIDs=%d FD scans=%d final PID=%s", uid, inode, candidates, fdScans, finalPID)
+		}()
+	}
 	buffer := make([]byte, unix.PathMax)
 	socket := fmt.Appendf(nil, "socket:[%d]", inode)
 
@@ -334,10 +348,16 @@ func resolveProcessNameByProcSearch(inode, uid uint32, matcher ProcessMatcher) (
 			continue
 		}
 		name, candidate, err := matchProcessCandidate(processPath, matcher)
+		if debug {
+			candidates++
+		}
 		if err != nil || !candidate {
 			continue
 		}
 		name, matched, err := findProcessNameInPath(processPath, name, socket, buffer)
+		if debug {
+			fdScans++
+		}
 		if err != nil {
 			if isTransientProcError(err) {
 				continue
@@ -345,6 +365,7 @@ func resolveProcessNameByProcSearch(inode, uid uint32, matcher ProcessMatcher) (
 			return "", err
 		}
 		if matched {
+			finalPID = pid
 			rememberProcessPID(uid, pid)
 			return name, nil
 		}
@@ -373,10 +394,16 @@ func resolveProcessNameByProcSearch(inode, uid uint32, matcher ProcessMatcher) (
 
 		processPath := filepath.Join("/proc", f.Name())
 		name, candidate, err := matchProcessCandidate(processPath, matcher)
+		if debug {
+			candidates++
+		}
 		if err != nil || !candidate {
 			continue
 		}
 		name, matched, err := findProcessNameInPath(processPath, name, socket, buffer)
+		if debug {
+			fdScans++
+		}
 		if err != nil {
 			if isTransientProcError(err) {
 				continue
@@ -384,6 +411,7 @@ func resolveProcessNameByProcSearch(inode, uid uint32, matcher ProcessMatcher) (
 			return "", err
 		}
 		if matched {
+			finalPID = f.Name()
 			rememberProcessPID(uid, f.Name())
 			return name, nil
 		}

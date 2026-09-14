@@ -153,9 +153,13 @@ func LoadPersistentCache() {
 	restored = true
 	persistMu.Unlock()
 	if replay {
-		entries := cachefile.Cache().DNSCache()
-		for name, c := range caches {
-			loadCache(name, c, entries)
+		entries, err := cachefile.Cache().ReadDNSCache()
+		if err != nil {
+			log.Fields(log.WARNING, map[string]string{"subsystem": "dns", "event": "persistent_cache_load_failed", "reason": err.Error()}, "[DNS] persistent cache load failed: %v", err)
+		} else {
+			for name, c := range caches {
+				loadCache(name, c, entries)
+			}
 		}
 	}
 	storeOnce.Do(startStoreLoop)
@@ -166,12 +170,11 @@ func LoadPersistentCache() {
 // optimistic-cache path serves it once and refreshes it in the background,
 // exactly as it would have without a restart.
 func loadCache(name string, c dnsCache, entries []cachefile.DNSEntry) {
-	if len(entries) == 0 {
-		return
-	}
-
 	prefix := name + keySep
 	restored := 0
+	stale := 0
+	invalid := 0
+	now := time.Now()
 	for _, entry := range entries {
 		key, ok := strings.CutPrefix(entry.Key, prefix)
 		if !ok {
@@ -179,14 +182,16 @@ func loadCache(name string, c dnsCache, entries []cachefile.DNSEntry) {
 		}
 		msg := new(D.Msg)
 		if err := msg.Unpack(entry.Msg); err != nil {
+			invalid++
 			continue
 		}
 		c.SetWithExpire(key, msg, entry.Expires)
 		restored++
+		if !now.Before(entry.Expires) {
+			stale++
+		}
 	}
-	if restored > 0 {
-		log.Infoln("[DNS] restored %d cached answers for the %s resolver", restored, name)
-	}
+	log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "persistent_cache_loaded", "resolver": name, "restored": fmt.Sprint(restored), "stale": fmt.Sprint(stale), "invalid": fmt.Sprint(invalid)}, "[DNS] persistent cache loaded for %s: restored=%d stale=%d invalid=%d", name, restored, stale, invalid)
 }
 
 // StoreCache writes the current DNS answer cache to the cache file. It is safe
@@ -219,8 +224,11 @@ func StoreCache() {
 		}
 	}
 
-	cachefile.Cache().SetDNSCache(entries)
-	log.Debugln("[DNS] stored %d cached answers to cache file", len(entries))
+	if err := cachefile.Cache().SetDNSCache(entries); err != nil {
+		log.Fields(log.WARNING, map[string]string{"subsystem": "dns", "event": "persistent_cache_flush_failed", "reason": err.Error()}, "[DNS] persistent cache flush failed: %v", err)
+		return
+	}
+	log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "persistent_cache_flushed", "entries": fmt.Sprint(len(entries))}, "[DNS] flushed %d cached answers to cache file", len(entries))
 }
 
 func startStoreLoop() {
@@ -284,7 +292,7 @@ func EvictNetworkScope(scope string) int {
 		}
 	}
 	if evicted > 0 {
-		log.Infoln("[DNS] evicted %d cached answers for a retired network scope", evicted)
+		log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "network_scope_evicted", "network_scope": scope, "entries": fmt.Sprint(evicted), "reason": "scope_retired"}, "[DNS] evicted %d cached answers for retired network scope %s", evicted, scope)
 	}
 	return evicted
 }

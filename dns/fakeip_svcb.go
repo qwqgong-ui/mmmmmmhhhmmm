@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/metacubex/mihomo/component/fakeip"
+	"github.com/metacubex/mihomo/log"
 
 	D "github.com/miekg/dns"
 )
@@ -20,6 +21,16 @@ type serviceRRSet struct {
 // record is synthesized.
 func rewriteFakeIPServiceBindings(msg *D.Msg, fakePool, fakePool6 *fakeip.Pool, fakeIPTTL int) bool {
 	modifiedRRsets := map[serviceRRSet]struct{}{}
+	if log.Enabled(log.DEBUG) {
+		before := InspectMessage(msg)
+		defer func() {
+			reason := "rrsets_unchanged_dnssec_preserved"
+			if len(modifiedRRsets) > 0 {
+				reason = "hints_rewritten_affected_rrsig_and_ad_cleared"
+			}
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "dns", "event": "fakeip_service_binding", "host": msgToDomain(msg), "reason": reason}, "Fake-IP HTTPS/SVCB bindings %+v -> %+v; AD=%t -> %t; %s", before.Bindings, InspectMessage(msg).Bindings, before.AuthenticatedData, msg.AuthenticatedData, reason)
+		}()
+	}
 
 	rewriteSection := func(records []D.RR) {
 		for _, record := range records {

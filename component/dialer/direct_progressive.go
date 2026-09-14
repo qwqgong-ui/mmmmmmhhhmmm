@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/component/diagstats"
 	R "github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/log"
 )
@@ -142,6 +143,14 @@ func runProgressiveDirectRace(
 	if cacheKey != "" && GetTcpConcurrent() {
 		cachedWinners, cachePending = tcpConcurrentCache.Winners(cacheKey)
 		if cachePending {
+			diagstats.Add(diagstats.DirectWinnerHit)
+		} else {
+			diagstats.Add(diagstats.DirectWinnerMiss)
+		}
+		if log.Enabled(log.DEBUG) {
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "winner_cache_lookup", "host": host, "network_scope": scope}, "DIRECT TCP %s:%s cached winners=%+v", host, port, cachedWinners)
+		}
+		if cachePending {
 			cachedWinners = slices.DeleteFunc(cachedWinners, func(winner tcpConcurrentWinner) bool {
 				return winner.IP.Is4() && network == "tcp6" ||
 					winner.IP.Is6() && (network == "tcp4" || R.DisableIPv6.Load())
@@ -176,6 +185,9 @@ func runProgressiveDirectRace(
 			return
 		}
 		delivered = true
+		if log.Enabled(log.DEBUG) {
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "tcp_winner", "host": host, "network_scope": scope}, "DIRECT TCP %s:%s first delivered winner=%s", host, port, ip)
+		}
 		sendResult(dialResult{ip: ip, Conn: conn})
 	}
 	promote := func(result progressiveConnectResult) {
@@ -217,6 +229,7 @@ func runProgressiveDirectRace(
 			connectOpt.tfo = false
 			started := time.Now()
 			conn, err := dialContext(ctx, network, ip, port, connectOpt)
+			logDirectAttempt(host, port, scope, ip, time.Since(started), err, false)
 			result := progressiveConnectResult{
 				dialResult: dialResult{ip: ip, Conn: conn, error: err},
 				ipv6:       ipv6,
@@ -281,6 +294,7 @@ func runProgressiveDirectRace(
 				connectOpt.tfo = false
 				started := time.Now()
 				conn, err := dialContext(ctx, network, winner.IP, port, connectOpt)
+				logDirectAttempt(host, port, scope, winner.IP, time.Since(started), err, true)
 				result := progressiveConnectResult{
 					dialResult: dialResult{ip: winner.IP, Conn: conn, error: err},
 					ipv6:       ipv6,
@@ -295,6 +309,9 @@ func runProgressiveDirectRace(
 					}
 				}
 			}()
+		}
+		if log.Enabled(log.DEBUG) {
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "race_budget", "host": host, "network_scope": scope}, "DIRECT TCP %s:%s cached race budget=%s winners=%+v", host, port, budget, winners)
 		}
 		fastTimer = time.NewTimer(budget)
 		fastTimeout = fastTimer.C
@@ -347,6 +364,9 @@ func runProgressiveDirectRace(
 			}
 			return
 		case event := <-events:
+			if !event.done && log.Enabled(log.DEBUG) {
+				log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "candidates", "host": host, "network_scope": scope}, "DIRECT TCP candidates source=%d ips=%v error=%v", event.Source, event.IPs, event.Err)
+			}
 			if event.done {
 				if cachePending && event.ipv6 == cachedIPv6 {
 					// That family produced nothing to validate the winners

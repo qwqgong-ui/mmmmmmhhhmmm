@@ -32,6 +32,7 @@ Go module，因此它们的补丁继续保存在 `patches/` 下并由构建流�
 - [TCP 并发胜出地址缓存（TCP Concurrent Winner Cache）](features/tcp-concurrent-winner-cache.md)
 - [代理提供者健康检查探测间隔控制（Provider Health-Check Probe Pacing）](features/provider-health-check-probe-pacing.md)
 - [通用混合 QUIC（Generic Hybrid QUIC）](features/generic-hybrid-quic.md)
+- [运行时诊断与结构化状态日志](features/runtime-diagnostics.md)
 - [AndroidCyaml 集成（AndroidCyaml Integration）](features/androidcyaml-integration.md)
 - [HY2 支持 ECN 反馈的 BBR（HY2 ECN-Aware BBR）](features/hy2-ecn-aware-bbr.md)
 - [HY2 使用 QUIC v2（HY2 QUIC v2）](features/hy2-quic-v2.md)

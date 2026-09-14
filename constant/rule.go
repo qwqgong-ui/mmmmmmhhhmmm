@@ -153,6 +153,8 @@ type RuleWrapper interface {
 }
 
 type RuleMatchHelper struct {
+	// Diagnostic previews do not count as traffic hits/misses.
+	Diagnostic    bool
 	ResolveIP     func()
 	FindProcess   func()
 	CheckPassRule func(adapterName string) bool

@@ -105,6 +105,11 @@ func SetUIPath(path string) {
 func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 	r := chi.NewRouter()
 	cors.Apply(r)
+	if secret != "" {
+		r.With(authentication(secret)).Get("/debug/path", debugPath)
+	} else {
+		r.Get("/debug/path", debugPath)
+	}
 	if isDebug {
 		r.Mount("/debug", func() http.Handler {
 			r := chi.NewRouter()
@@ -135,6 +140,11 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Mount("/cache", cacheRouter())
 		r.Mount("/dns", dnsRouter())
 		r.Mount("/storage", storageRouter())
+		r.Get("/network", getNetworkDiagnostic)
+		r.Get("/direct/winners", getDirectWinners)
+		r.Get("/hybrid-quic/stats", getHybridStats)
+		r.Get("/hybrid-quic/flows", getHybridFlows)
+		r.Get("/stats/downstream", getDownstreamStats)
 		if !embedMode { // disallow restart in embed mode
 			r.Mount("/restart", restartRouter())
 		}
@@ -498,13 +508,21 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var wsConn net.Conn
-	if r.Header.Get("Upgrade") == "websocket" {
-		var err error
-		wsConn, _, err = wsUpgrade(r, w)
+	var wsConn *logWebSocket
+	var wsClosed <-chan struct{}
+	if strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+		conn, rw, err := wsUpgrade(r, w)
 		if err != nil {
+			if conn != nil {
+				conn.Close()
+			}
 			return
 		}
+		wsConn = &logWebSocket{Conn: conn}
+		defer wsConn.Close()
+		done := make(chan struct{})
+		wsClosed = done
+		go wsConn.readUntilClosed(rw.Reader, done)
 	}
 
 	if wsConn == nil {
@@ -512,23 +530,35 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 		render.Status(r, http.StatusOK)
 	}
 
-	ch := make(chan log.Event, 1024)
-	sub := log.Subscribe()
+	filters := r.URL.Query()
+	sub := log.SubscribeLevel(level)
 	defer log.UnSubscribe(sub)
 	buf := &bytes.Buffer{}
 
-	go func() {
-		for logM := range sub {
-			select {
-			case ch <- logM:
-			default:
+	for {
+		var logM log.Event
+		select {
+		case <-r.Context().Done():
+			return
+		case <-wsClosed:
+			return
+		case event, ok := <-sub:
+			if !ok {
+				return
+			}
+			logM = event
+		}
+		if logM.LogLevel < level {
+			continue
+		}
+		filtered := false
+		for _, key := range []string{"subsystem", "event", "flow_id", "network_scope", "host", "proxy", "reason"} {
+			if want := filters.Get(key); want != "" && logM.Fields[key] != want {
+				filtered = true
+				break
 			}
 		}
-		close(ch)
-	}()
-
-	for logM := range ch {
-		if logM.LogLevel < level {
+		if filtered {
 			continue
 		}
 		buf.Reset()
@@ -545,11 +575,15 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 			if newLevel == "warning" {
 				newLevel = "warn"
 			}
+			fields := make([]LogStructuredField, 0, len(logM.Fields))
+			for key, value := range logM.Fields {
+				fields = append(fields, LogStructuredField{Key: key, Value: value})
+			}
 			if err := json.NewEncoder(buf).Encode(LogStructured{
-				Time:    time.Now().Format(time.TimeOnly),
+				Time:    logM.Time.Format(time.RFC3339Nano),
 				Level:   newLevel,
 				Message: logM.Payload,
-				Fields:  []LogStructuredField{},
+				Fields:  fields,
 			}); err != nil {
 				break
 			}
@@ -557,10 +591,11 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 
 		var err error
 		if wsConn == nil {
+			_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(5 * time.Second))
 			_, err = w.Write(buf.Bytes())
 			w.(http.Flusher).Flush()
 		} else {
-			err = wsWriteServerText(wsConn, buf.Bytes())
+			err = wsConn.write(1, buf.Bytes())
 		}
 
 		if err != nil {

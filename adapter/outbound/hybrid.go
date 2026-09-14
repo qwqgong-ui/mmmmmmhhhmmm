@@ -26,6 +26,8 @@ func (h *Hybrid) ListenPacketContext(ctx context.Context, metadata *C.Metadata) 
 	original := *metadata
 	streamDialer := proxydialer.New(h.ProxyAdapter, false)
 	pc := hybrid.NewPacketConn(hybrid.ClientOptions{
+		Proxy:        h.Name(),
+		NetworkScope: dialer.NetworkScope(h.DialOptions()...),
 		Dial: func(ctx context.Context) (net.Conn, error) {
 			return streamDialer.DialContext(ctx, "tcp", hybrid.Address)
 		},

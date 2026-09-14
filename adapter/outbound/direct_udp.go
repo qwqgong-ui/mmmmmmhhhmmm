@@ -16,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/component/directrace"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
 
 const (
@@ -259,6 +260,9 @@ func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.Ad
 		return errors.New("no usable DIRECT UDP candidate")
 	}
 	c.targets[logical] = target
+	if log.Enabled(log.DEBUG) {
+		log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "udp_race_started", "host": host, "proxy": adapter, "candidate_count": fmt.Sprint(len(target.candidates))}, "DIRECT UDP candidates %s: %v", host, target.candidates)
+	}
 	return nil
 }
 
@@ -410,6 +414,9 @@ func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, e
 		c.mu.Unlock()
 		if confirmedQUICWinner.IsValid() {
 			directrace.Store(host, adapter, confirmedQUICWinner)
+			if log.Enabled(log.DEBUG) {
+				log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "quic_winner_confirmed", "host": host, "proxy": adapter, "reason": "server_cid_1rtt"}, "DIRECT QUIC confirmed winner %s --> %s", host, confirmedQUICWinner)
+			}
 		}
 		return c.writeCandidates(payload, candidates)
 	}

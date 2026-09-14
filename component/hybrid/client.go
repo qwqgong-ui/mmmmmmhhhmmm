@@ -9,6 +9,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 const probeInterval = 250 * time.Millisecond
@@ -16,9 +18,10 @@ const probeTimeout = 3 * time.Second
 const rawSilence = 15 * time.Second
 
 type ClientOptions struct {
-	Dial     func(context.Context) (net.Conn, error)
-	Raw      func(context.Context, netip.AddrPort) (net.PacketConn, error)
-	Fallback func(context.Context) (net.PacketConn, error)
+	Proxy, NetworkScope string
+	Dial                func(context.Context) (net.Conn, error)
+	Raw                 func(context.Context, netip.AddrPort) (net.PacketConn, error)
+	Fallback            func(context.Context) (net.PacketConn, error)
 }
 type PacketConn struct {
 	opts            ClientOptions
@@ -46,7 +49,9 @@ type clientFlow struct {
 	mu                           sync.Mutex
 	disabled, active             bool
 	probeEnd, nextProbe, lastRaw time.Time
+	disableNotified              bool // protected by writeMu
 	done                         chan struct{}
+	diagnostic                   *flowDiagnostic
 }
 type result struct {
 	p   []byte
@@ -90,7 +95,10 @@ func (c *PacketConn) WriteTo(p []byte, a net.Addr) (int, error) {
 			c.mu.Unlock()
 			return c.writeFallback(p, a)
 		}
-		f = &clientFlow{owner: c, ready: make(chan struct{}), done: make(chan struct{})}
+		f = &clientFlow{owner: c, ready: make(chan struct{}), done: make(chan struct{}), diagnostic: newFlowDiagnostic(key, c.opts.Proxy, c.opts.NetworkScope)}
+		if log.Enabled(log.DEBUG) {
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "initial_detected", "flow_id": f.diagnostic.FlowID, "host": host, "proxy": c.opts.Proxy, "network_scope": c.opts.NetworkScope}, "Hybrid QUIC Initial detected for %s", key)
+		}
 		c.flows[key] = f
 		go f.open(key)
 	}
@@ -112,11 +120,20 @@ func (f *clientFlow) open(address string) {
 	stream, err := c.opts.Dial(ctx)
 	if err != nil {
 		f.err = err
+		f.diagnostic.update("fallback", "", "stream_dial_error", false)
+		f.diagnostic.close()
 		close(f.ready)
 		return
 	}
 	stop := context.AfterFunc(ctx, func() { stream.Close() })
-	fail := func(err error) { stop(); stream.Close(); f.err = err; close(f.ready) }
+	fail := func(err error) {
+		f.diagnostic.update("fallback", "", "registration_error", false)
+		f.diagnostic.close()
+		stop()
+		stream.Close()
+		f.err = err
+		close(f.ready)
+	}
 	stream.SetDeadline(time.Now().Add(10 * time.Second))
 	if err = WriteRequest(stream, Request{Target: address}); err != nil {
 		fail(err)
@@ -176,23 +193,37 @@ func (f *clientFlow) open(address string) {
 	f.stream = stream
 	stream.SetWriteDeadline(c.writeDeadline)
 	c.mu.Unlock()
+	f.diagnostic.update("tunnel", f.relay.String(), "", false)
+	if log.Enabled(log.DEBUG) {
+		log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "hqs1_registered", "flow_id": f.diagnostic.FlowID, "host": address}, "HQS1 registered target=%s raw_endpoint=%s", f.target, f.relay)
+	}
 	close(f.ready)
 	go f.readStream()
 	go f.watch()
 	if f.raw != nil {
 		go f.readRaw()
 	} else {
-		f.disable(true)
+		f.disable(true, "raw_setup_error")
 	}
 }
-func (f *clientFlow) disable(notify bool) error {
+func (f *clientFlow) disable(notify bool, reason string) error {
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
+	return f.disableLocked(notify, reason)
+}
+
+func (f *clientFlow) disableLocked(notify bool, reason string) error {
 	f.mu.Lock()
 	f.disabled = true
 	f.active = false
 	f.mu.Unlock()
-	// Sending an idempotent zero frame also covers raw setup failure.
+	f.diagnostic.update("tunnel", "", reason, false)
+	// A permanent fallback sends at most one disable frame, including setup
+	// failure. A peer acknowledgement must not overwrite the original reason.
+	if f.disableNotified {
+		return nil
+	}
+	f.disableNotified = true
 	if notify {
 		return WriteFrame(f.stream, nil)
 	}
@@ -204,11 +235,13 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	now := time.Now()
 	f.mu.Lock()
 	disable := false
+	disableReason := ""
 	raw, probe := false, false
 	if !f.disabled && Short(p) {
 		if f.active {
 			if !f.lastRaw.IsZero() && now.Sub(f.lastRaw) >= rawSilence {
 				disable = true
+				disableReason = "raw_silence"
 			} else {
 				raw = true
 			}
@@ -218,6 +251,7 @@ func (f *clientFlow) write(p []byte) (int, error) {
 			}
 			if !now.Before(f.probeEnd) {
 				disable = true
+				disableReason = "probe_timeout"
 			} else if !now.Before(f.nextProbe) {
 				probe = true
 				f.nextProbe = now.Add(probeInterval)
@@ -230,31 +264,27 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	}
 	f.mu.Unlock()
 	if disable {
-		if err := WriteFrame(f.stream, nil); err != nil {
+		if err := f.disableLocked(true, disableReason); err != nil {
 			return 0, err
 		}
 	}
 	if raw {
 		if _, err := f.raw.WriteTo(p, net.UDPAddrFromAddrPort(f.relay)); err == nil {
+			f.diagnostic.touch(now)
 			return len(p), nil
 		}
-		f.mu.Lock()
-		f.disabled = true
-		f.active = false
-		f.mu.Unlock()
-		if err := WriteFrame(f.stream, nil); err != nil {
+		if err := f.disableLocked(true, "socket_write_error"); err != nil {
 			return 0, err
 		}
 	}
 	if err := WriteFrame(f.stream, p); err != nil {
 		return 0, err
 	}
+	f.diagnostic.touch(now)
 	if probe {
+		f.diagnostic.update("probing", f.relay.String(), "", true)
 		if _, err := f.raw.WriteTo(p, net.UDPAddrFromAddrPort(f.relay)); err != nil {
-			f.mu.Lock()
-			f.disabled = true
-			f.mu.Unlock()
-			if err = WriteFrame(f.stream, nil); err != nil {
+			if err = f.disableLocked(true, "probe_write_error"); err != nil {
 				return 0, err
 			}
 		}
@@ -263,6 +293,7 @@ func (f *clientFlow) write(p []byte) (int, error) {
 }
 func (f *clientFlow) readStream() {
 	defer func() {
+		f.diagnostic.close()
 		close(f.done)
 		f.stream.Close()
 		if f.raw != nil {
@@ -279,9 +310,10 @@ func (f *clientFlow) readStream() {
 			continue
 		}
 		if len(p) == 0 {
-			f.disable(false)
+			f.disable(false, "peer_disabled_raw")
 			continue
 		}
+		f.diagnostic.touch(time.Now())
 		f.owner.deliver(result{p: p, a: net.UDPAddrFromAddrPort(f.target)})
 	}
 }
@@ -290,8 +322,13 @@ func (f *clientFlow) readRaw() {
 	for {
 		n, a, err := f.raw.ReadFrom(b)
 		if err != nil {
+			select {
+			case <-f.done:
+				return
+			default:
+			}
 			if f.owner.ctx.Err() == nil {
-				if err = f.disable(true); err != nil {
+				if err = f.disable(true, "socket_read_error"); err != nil {
 					f.owner.deliver(result{err: err})
 				}
 			}
@@ -305,9 +342,14 @@ func (f *clientFlow) readRaw() {
 			f.mu.Unlock()
 			continue
 		}
+		becameActive := !f.active
 		f.active = true
 		f.lastRaw = time.Now()
+		f.diagnostic.touch(f.lastRaw)
 		f.mu.Unlock()
+		if becameActive {
+			f.diagnostic.update("raw", f.relay.String(), "", false)
+		}
 		f.owner.deliver(result{p: append([]byte(nil), b[:n]...), a: net.UDPAddrFromAddrPort(f.target)})
 	}
 }
@@ -399,6 +441,7 @@ func (c *PacketConn) Close() error {
 		c.mu.Lock()
 		defer c.mu.Unlock()
 		for _, f := range c.flows {
+			f.diagnostic.close()
 			if f.stream != nil {
 				f.stream.Close()
 				if f.raw != nil {
@@ -456,7 +499,13 @@ func (f *clientFlow) watch() {
 		case now := <-ticker.C:
 			f.writeMu.Lock()
 			f.mu.Lock()
-			expired := !f.disabled && ((f.active && now.Sub(f.lastRaw) >= rawSilence) || (!f.active && !f.probeEnd.IsZero() && !now.Before(f.probeEnd)))
+			reason := ""
+			if !f.disabled && f.active && now.Sub(f.lastRaw) >= rawSilence {
+				reason = "raw_silence"
+			} else if !f.disabled && !f.active && !f.probeEnd.IsZero() && !now.Before(f.probeEnd) {
+				reason = "probe_timeout"
+			}
+			expired := reason != ""
 			if expired {
 				f.disabled = true
 				f.active = false
@@ -464,7 +513,7 @@ func (f *clientFlow) watch() {
 			f.mu.Unlock()
 			var err error
 			if expired {
-				err = WriteFrame(f.stream, nil)
+				err = f.disableLocked(true, reason)
 			}
 			if err == nil && now.Sub(lastKeep) >= 30*time.Second {
 				err = WriteKeepAlive(f.stream)

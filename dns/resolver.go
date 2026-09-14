@@ -180,17 +180,22 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, e
 	domain := msgToDomain(m)
 	msg, expireTime, hit := getMsgFromCache(r.cache, q)
 	if hit {
-		log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
+		if log.Enabled(log.DEBUG) {
+			log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
+		}
 		now := time.Now()
 		if expireTime.Before(now) {
+			logDNSCache(q, "stale", "")
 			setMsgTTL(msg, uint32(3)) // Continue fetch
 			continueFetch = true
 		} else {
+			logDNSCache(q, "fresh", "")
 			// updating TTL by subtracting common delta time from each DNS record
 			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
 		}
 		return
 	}
+	logDNSCache(q, "miss", "")
 	return r.exchangeWithoutCache(ctx, m)
 }
 

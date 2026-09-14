@@ -3,9 +3,12 @@ package dns
 import (
 	"context"
 	"errors"
+	"fmt"
+	"time"
 
 	"github.com/metacubex/mihomo/component/resolver"
 	icontext "github.com/metacubex/mihomo/context"
+	"github.com/metacubex/mihomo/log"
 	D "github.com/miekg/dns"
 )
 
@@ -19,7 +22,16 @@ func (s *Service) ServeMsg(ctx context.Context, msg *D.Msg) (*D.Msg, error) {
 		return nil, errors.New("at least one question is required")
 	}
 
-	r, err := s.handler(icontext.NewDNSContext(ctx), msg)
+	dnsCtx := icontext.NewDNSContext(ctx)
+	debug := log.Enabled(log.DEBUG)
+	var start time.Time
+	if debug {
+		start = time.Now()
+	}
+	r, err := s.handler(dnsCtx, msg)
+	if debug {
+		log.Fields(log.DEBUG, map[string]string{"subsystem": "dns", "event": "query_decision", "host": msgToDomain(msg), "source": dnsCtx.Type(), "latency_ms": fmt.Sprint(float64(time.Since(start)) / float64(time.Millisecond))}, "DNS %s -> %s error=%v", msg.Question[0].String(), dnsCtx.Type(), err)
+	}
 	if err != nil {
 		return r, err
 	}

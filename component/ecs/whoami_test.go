@@ -95,7 +95,8 @@ func TestDiscoverPrefixFallsBackToWhoami(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	prefix, err := discoverPrefix(ctx, true)
+	prefix, source, err := discoverPrefix(ctx, true)
 	assert.NoError(t, err)
 	assert.Equal(t, netip.MustParsePrefix("203.0.113.0/24"), prefix)
+	assert.Equal(t, "whoami", source)
 }

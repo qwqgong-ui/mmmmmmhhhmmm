@@ -2,6 +2,7 @@ package directrace
 
 import (
 	"net/netip"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -18,6 +19,17 @@ type winnerKey struct {
 type winnerEntry struct {
 	ip      netip.Addr
 	expires time.Time
+}
+
+type WinnerSnapshot struct {
+	Host        string    `json:"host"`
+	Adapter     string    `json:"proxy"`
+	Family      string    `json:"family"`
+	IP          string    `json:"ip"`
+	ExpiresAt   time.Time `json:"expiresAt"`
+	LastSuccess time.Time `json:"lastSuccess"`
+	ScopeKnown  bool      `json:"scopeKnown"`
+	RTTKnown    bool      `json:"rttKnown"`
 }
 
 var winners = struct {
@@ -91,6 +103,39 @@ func Prefer(host, adapter string, candidates []netip.Addr) (netip.Addr, bool) {
 		}
 	}
 	return netip.Addr{}, false
+}
+
+// Snapshot returns a copy of every live, application-confirmed UDP/QUIC warm
+// winner. Reading diagnostics does not evict entries or refresh their TTL.
+func Snapshot(host string) []WinnerSnapshot {
+	now := time.Now()
+	host = canonicalHost(host)
+	winners.Lock()
+	defer winners.Unlock()
+	result := make([]WinnerSnapshot, 0, len(winners.entries))
+	for key, entry := range winners.entries {
+		if !now.Before(entry.expires) {
+			continue
+		}
+		if host != "" && key.host != host {
+			continue
+		}
+		family := "ipv4"
+		if key.ipv6 {
+			family = "ipv6"
+		}
+		result = append(result, WinnerSnapshot{Host: key.host, Adapter: key.adapter, Family: family, IP: entry.ip.String(), ExpiresAt: entry.expires, LastSuccess: entry.expires.Add(-winnerTTL)})
+	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].Host != result[j].Host {
+			return result[i].Host < result[j].Host
+		}
+		if result[i].Adapter != result[j].Adapter {
+			return result[i].Adapter < result[j].Adapter
+		}
+		return result[i].Family < result[j].Family
+	})
+	return result
 }
 
 func canonicalHost(host string) string {

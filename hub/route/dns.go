@@ -16,6 +16,8 @@ import (
 func dnsRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/query", queryDNS)
+	r.Get("/cache", getDNSCache)
+	r.Get("/server-capabilities", getServerCapabilities)
 	return r
 }
 

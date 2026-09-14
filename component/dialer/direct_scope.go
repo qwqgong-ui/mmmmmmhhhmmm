@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/log"
 )
 
 var directNetworkEnvironment = atomic.NewTypedValue[string]("")
@@ -15,7 +16,75 @@ var directNetworkEnvironment = atomic.NewTypedValue[string]("")
 // identity when the Go process cannot discover the physical path itself. The
 // Android VPN wrapper uses a privacy-preserving Wi-Fi/SIM fingerprint.
 func SetDirectNetworkEnvironment(environment string) {
-	directNetworkEnvironment.Store(strings.TrimSpace(environment))
+	environment = strings.TrimSpace(environment)
+	old := directNetworkEnvironment.Swap(environment)
+	if old == environment {
+		return
+	}
+	log.Fields(log.INFO, map[string]string{"subsystem": "network", "event": "scope_changed", "network_scope": EnvironmentScope(environment), "old_network_scope": EnvironmentScope(old), "reason": "platform_update"}, "Network scope changed: %s -> %s", EnvironmentScope(old), EnvironmentScope(environment))
+}
+
+type NetworkStatus struct {
+	Interface      string `json:"interface"`
+	NetworkScope   string `json:"networkScope"`
+	IPv4           bool   `json:"ipv4"`
+	IPv6           bool   `json:"ipv6"`
+	AddressesKnown bool   `json:"addressesKnown"`
+	Reason         string `json:"reason,omitempty"`
+}
+
+func CurrentNetworkStatus() NetworkStatus {
+	name := currentInterfaceName("")
+	status := NetworkStatus{Interface: name, NetworkScope: "default"}
+	if name != "" {
+		status.NetworkScope = name
+	}
+	environment := EnvironmentScope(directNetworkEnvironment.Load())
+	if environment != "" {
+		status.NetworkScope = environment
+	}
+	if name == "" {
+		status.Reason = "physical_interface_unknown"
+		return status
+	}
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		status.Reason = err.Error()
+		return status
+	}
+	addresses, err := iface.Addrs()
+	if err != nil {
+		status.Reason = err.Error()
+		return status
+	}
+	status.AddressesKnown = true
+	prefixes := make([]netip.Prefix, 0, len(addresses))
+	for _, address := range addresses {
+		prefix, err := netip.ParsePrefix(address.String())
+		if err != nil || prefix.Addr().IsLoopback() || prefix.Addr().IsLinkLocalUnicast() {
+			continue
+		}
+		prefixes = append(prefixes, prefix)
+		if prefix.Addr().Is4() {
+			status.IPv4 = true
+		} else {
+			status.IPv6 = true
+		}
+	}
+	if environment == "" {
+		status.NetworkScope = scopeForPrefixes(name, prefixes)
+	}
+	return status
+}
+
+// NetworkScope applies the outbound's interface choice when describing its
+// path, rather than mislabelling a bound socket with the default interface.
+func NetworkScope(options ...Option) string {
+	var opt option
+	for _, apply := range options {
+		apply(&opt)
+	}
+	return directNetworkScope(opt)
 }
 
 // environmentScopePrefix marks a scope the platform named rather than one
@@ -38,15 +107,7 @@ func directNetworkScope(opt option) string {
 	if environment := directNetworkEnvironment.Load(); environment != "" {
 		return environmentScopePrefix + environment
 	}
-	interfaceName := opt.interfaceName
-	if interfaceName == "" {
-		interfaceName = DefaultInterface.Load()
-	}
-	if interfaceName == "" {
-		if finder := DefaultInterfaceFinder.Load(); finder != nil {
-			interfaceName = finder.FindInterfaceName(netip.MustParseAddr("1.1.1.1"))
-		}
-	}
+	interfaceName := currentInterfaceName(opt.interfaceName)
 	if interfaceName == "" {
 		return "default"
 	}
@@ -68,6 +129,19 @@ func directNetworkScope(opt option) string {
 		prefixes = append(prefixes, prefix)
 	}
 	return scopeForPrefixes(interfaceName, prefixes)
+}
+
+func currentInterfaceName(configured string) string {
+	if configured != "" {
+		return configured
+	}
+	if name := DefaultInterface.Load(); name != "" {
+		return name
+	}
+	if finder := DefaultInterfaceFinder.Load(); finder != nil {
+		return finder.FindInterfaceName(netip.MustParseAddr("1.1.1.1"))
+	}
+	return ""
 }
 
 func scopeForPrefixes(interfaceName string, prefixes []netip.Prefix) string {

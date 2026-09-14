@@ -360,13 +360,25 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 			return
 		}
 		l.defaultInterfaceMonitor = defaultInterfaceMonitor
+		lastNetworkStatus := dialer.CurrentNetworkStatus()
+		var networkScopeMu sync.Mutex
 		defaultInterfaceMonitor.RegisterCallback(func(defaultInterface *control.Interface, event int) {
-			if defaultInterface != nil {
-				log.Warnln("[TUN] default interface changed by monitor, => %s", defaultInterface.Name)
-			} else {
-				log.Errorln("[TUN] default interface lost by monitor")
-			}
 			iface.FlushCache()
+			status := dialer.CurrentNetworkStatus()
+			if defaultInterface == nil {
+				status = dialer.NetworkStatus{NetworkScope: "unavailable", AddressesKnown: true, Reason: "default_interface_lost"}
+			}
+			networkScopeMu.Lock()
+			oldStatus := lastNetworkStatus
+			lastNetworkStatus = status
+			networkScopeMu.Unlock()
+			reason := "default_interface_changed"
+			if defaultInterface == nil {
+				reason = "default_interface_lost"
+			}
+			if oldStatus != status {
+				log.Fields(log.INFO, map[string]string{"subsystem": "network", "event": "scope_changed", "network_scope": status.NetworkScope, "old_network_scope": oldStatus.NetworkScope, "interface": status.Interface, "ipv4": fmt.Sprint(status.IPv4), "ipv6": fmt.Sprint(status.IPv6), "reason": reason}, "Network scope changed: %s -> %s (interface=%s, ipv4=%t, ipv6=%t)", oldStatus.NetworkScope, status.NetworkScope, status.Interface, status.IPv4, status.IPv6)
+			}
 			resolver.ResetConnection() // reset resolver's connection after default interface changed
 			ecs.Refresh()              // the direct egress address may have changed with it
 		})

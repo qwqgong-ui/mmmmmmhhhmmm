@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/netip"
 	"strings"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/component/diagstats"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 	M "github.com/metacubex/sing/common/metadata"
@@ -330,8 +332,14 @@ func reportUDPICMPError(packet C.UDPPacket, addr net.Addr, err error) {
 	default:
 		return
 	}
-	if reportErr := reporter.ReportICMPError(icmpError, mtu); reportErr != nil {
-		log.Debugln("[UDP] report %s to %s failed: %v", icmpError, packet.LocalAddr(), reportErr)
+	reportErr := reporter.ReportICMPError(icmpError, mtu)
+	if reportErr != nil {
+		diagstats.Add(diagstats.ICMPWriteError)
+	} else {
+		diagstats.Add(diagstats.ICMPReported)
+	}
+	if log.Enabled(log.DEBUG) {
+		log.Fields(log.DEBUG, map[string]string{"subsystem": "tun", "event": "icmp_report", "reason": icmpError.String(), "writeback_ok": fmt.Sprint(reportErr == nil)}, "UDP socket error=%v -> ICMP %s mtu=%d sender=%s report_error=%v", err, icmpError, mtu, packet.LocalAddr(), reportErr)
 	}
 }
 

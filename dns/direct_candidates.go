@@ -62,8 +62,10 @@ func (r *Resolver) exchangeDirectSource(ctx context.Context, source int, query *
 	client := r.main[source]
 	domain := msgToDomain(query)
 	_, qType := msgToQtype(query)
-	log.Debugln("[DNS] resolve %s %s from direct-nameserver #%d %s", domain, qType, source+1, client.Address())
-	msg, err := client.ExchangeContext(ctx, query)
+	if log.Enabled(log.DEBUG) {
+		log.Debugln("[DNS] resolve %s %s from direct-nameserver #%d %s", domain, qType, source+1, client.Address())
+	}
+	msg, err := exchangeDiagnostic(ctx, client, query, source+1)
 	if err != nil {
 		return nil, err
 	}
@@ -76,7 +78,9 @@ func (r *Resolver) exchangeDirectSource(ctx context.Context, source int, query *
 	if len(msgToIP(msg)) == 0 {
 		return nil, R.ErrIPNotFound
 	}
-	log.Debugln("[DNS] %s --> %s from direct-nameserver #%d %s", domain, msgToLogString(msg), source+1, client.Address())
+	if log.Enabled(log.DEBUG) {
+		log.Debugln("[DNS] %s --> %s from direct-nameserver #%d %s", domain, msgToLogString(msg), source+1, client.Address())
+	}
 	return msg, nil
 }
 
@@ -131,9 +135,11 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			return
 		}
 		if msg, expires, hit := r.cache.GetWithExpire(key); hit && msg != nil && time.Now().Before(expires) {
+			logDNSCache(q, "fresh", networkScope)
 			output <- R.IPCandidateBatch{IPs: msgToIP(msg), Source: -1}
 			return
 		} else if !hit {
+			logDNSCache(q, "miss", networkScope)
 			var errs []error
 			for source := range r.main {
 				msg, err := r.exchangeDirectSource(ctx, source, new(D.Msg).SetQuestion(q.Name, q.Qtype))
@@ -150,6 +156,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			return
 		}
 
+		logDNSCache(q, "stale", networkScope)
 		parallel := min(2, len(r.main))
 		if candidates := r.directCachedCandidates(key, len(r.main)); len(candidates) != 0 {
 			_, qType := msgToQtype(query)

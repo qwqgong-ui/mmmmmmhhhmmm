@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"fmt"
 	"net/netip"
 	"time"
 
@@ -62,6 +63,25 @@ type runtimeIPv6State struct {
 	general              *config.General
 	dns                  *config.DNS
 	tun                  LC.Tun
+}
+
+type RuntimeIPv6Status struct {
+	Configured      bool   `json:"configured"`
+	SystemAvailable bool   `json:"systemAvailable"`
+	AvailableKnown  bool   `json:"availableKnown"`
+	Active          bool   `json:"active"`
+	Initialized     bool   `json:"initialized"`
+	Source          string `json:"source"`
+}
+
+func IPv6Status() RuntimeIPv6Status {
+	mux.Lock()
+	defer mux.Unlock()
+	source := "native_detection"
+	if runtimeIPv6Controller.systemAvailableKnown {
+		source = "platform"
+	}
+	return RuntimeIPv6Status{Configured: runtimeIPv6Controller.configured, SystemAvailable: runtimeIPv6Controller.currentSystemAvailable(checkSystemIPv6), AvailableKnown: true, Active: runtimeIPv6Controller.active, Initialized: runtimeIPv6Controller.initialized, Source: source}
 }
 
 // currentSystemAvailable returns the embedding platform's last authoritative
@@ -267,11 +287,13 @@ func applyRuntimeIPv6AvailabilityLocked(systemAvailable bool) {
 	}
 	resolver.ResetConnection()
 
+	reason := "system_unavailable"
 	if active {
-		log.Infoln("System IPv6 became available; runtime IPv6 enabled")
-	} else {
-		log.Warnln("System IPv6 became unavailable; runtime IPv6 disabled")
+		reason = "system_available"
+	} else if !runtimeIPv6Controller.configured {
+		reason = "configuration_disabled"
 	}
+	log.Fields(log.INFO, map[string]string{"subsystem": "network", "event": "ipv6_state_changed", "reason": reason, "configured": fmt.Sprint(runtimeIPv6Controller.configured), "system_available": fmt.Sprint(systemAvailable), "active": fmt.Sprint(active)}, "Runtime IPv6 state changed: active=%t (%s)", active, reason)
 }
 
 // SetSystemIPv6Available lets an embedding platform provide its authoritative

@@ -17,6 +17,7 @@ package ecs
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/netip"
 	"sync"
 	"time"
@@ -64,7 +65,32 @@ var (
 	// gets an IPv4 subnet and an AAAA query an IPv6 one
 	prefix4 atomic.TypedValue[netip.Prefix]
 	prefix6 atomic.TypedValue[netip.Prefix]
+	source4 atomic.TypedValue[string]
+	source6 atomic.TypedValue[string]
 )
+
+type Status struct {
+	Enabled    bool   `json:"enabled"`
+	Generation uint64 `json:"generation"`
+	IPv4Prefix string `json:"ipv4Prefix,omitempty"`
+	IPv4Source string `json:"ipv4Source,omitempty"`
+	IPv6Prefix string `json:"ipv6Prefix,omitempty"`
+	IPv6Source string `json:"ipv6Source,omitempty"`
+}
+
+func Snapshot() Status {
+	mu.Lock()
+	defer mu.Unlock()
+	status := Status{Enabled: enabled, Generation: generation}
+	if prefix := prefix4.Load(); prefix.IsValid() {
+		status.IPv4Prefix = prefix.String()
+	}
+	if prefix := prefix6.Load(); prefix.IsValid() {
+		status.IPv6Prefix = prefix.String()
+	}
+	status.IPv4Source, status.IPv6Source = source4.Load(), source6.Load()
+	return status
+}
 
 // Prefix returns the most recently discovered client subnet for the requested
 // family, falling back to the other family when only that one is known (a
@@ -92,6 +118,8 @@ func Setup(enable bool) {
 		generation++
 		prefix4.Store(netip.Prefix{})
 		prefix6.Store(netip.Prefix{})
+		source4.Store("")
+		source6.Store("")
 		if cancelRound != nil {
 			cancelRound()
 		}
@@ -125,6 +153,8 @@ func trigger(reason string) {
 	generation++
 	prefix4.Store(netip.Prefix{})
 	prefix6.Store(netip.Prefix{})
+	source4.Store("")
+	source6.Store("")
 	if cancelRound != nil {
 		cancelRound()
 	}
@@ -199,6 +229,7 @@ func discoverLoop(reason string) {
 		delay = retryDelays[attempt]
 		attempt++
 		mu.Unlock()
+		log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "ecs_retry_scheduled", "reason": reason, "ecs_generation": fmt.Sprint(currentGeneration), "retry_delay_ms": fmt.Sprint(delay.Milliseconds()), "attempt": fmt.Sprint(attempt)}, "[ECS] discovery retry %d scheduled in %s (%s)", attempt, delay, reason)
 		timer := time.NewTimer(delay)
 		select {
 		case <-wake:
@@ -236,22 +267,30 @@ func store(ctx context.Context, ipv4 bool, reason string, roundGeneration uint64
 	if !ipv4 {
 		name, target = "IPv6", &prefix6
 	}
-	found, err := discoverPrefix(ctx, ipv4)
-	if err != nil {
-		// The worker retries an empty round; never restore a previous network's prefix.
-		log.Warnln("[ECS] discover %s client subnet failed (%s): %s", name, reason, err.Error())
-		return
-	}
+	found, source, err := discoverPrefix(ctx, ipv4)
 	mu.Lock()
 	defer mu.Unlock()
-	if !enabled || generation != roundGeneration || ctx.Err() != nil {
+	if !enabled || generation != roundGeneration || errors.Is(ctx.Err(), context.Canceled) {
 		return
+	}
+	if err != nil {
+		// The worker retries an empty round; never restore a previous network's prefix.
+		log.Fields(log.WARNING, map[string]string{"subsystem": "dns", "event": "ecs_discovery_failed", "reason": reason, "family": name, "ecs_generation": fmt.Sprint(roundGeneration)}, "[ECS] discover %s client subnet failed (%s): %s", name, reason, err.Error())
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if ipv4 {
+		source4.Store(source)
+	} else {
+		source6.Store(source)
 	}
 	if old := target.Swap(found); old == found {
 		log.Debugln("[ECS] %s client subnet unchanged (%s): %s", name, reason, found)
 		return
 	}
-	log.Infoln("[ECS] %s client subnet updated (%s): %s", name, reason, found)
+	log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "ecs_updated", "reason": reason, "family": name, "source": source, "ecs_generation": fmt.Sprint(roundGeneration)}, "[ECS] %s client subnet updated (%s, %s): %s", name, reason, source, found)
 }
 
 // discoverPrefix races the two probe kinds and takes the first address that
@@ -259,26 +298,30 @@ func store(ctx context.Context, ipv4 bool, reason string, roundGeneration uint64
 // presents — but they fail in different places: STUN is purpose-built yet
 // speaks ports (3478 and friends) that networks like to filter, while the DNS
 // whoami probes need nothing but UDP/53.
-func discoverPrefix(ctx context.Context, ipv4 bool) (netip.Prefix, error) {
+func discoverPrefix(ctx context.Context, ipv4 bool) (netip.Prefix, string, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel() // stop the slower probe as soon as one has answered
 
 	type result struct {
-		addr netip.Addr
-		err  error
+		addr   netip.Addr
+		err    error
+		source string
 	}
 	// snapshot the probe configuration here, so the goroutines never read
 	// package state concurrently
 	servers, whoami := stunServers, whoamiProbes
-	probes := []func() (netip.Addr, error){
-		func() (netip.Addr, error) { return discoverSTUN(ctx, ipv4, servers) },
-		func() (netip.Addr, error) { return discoverWhoami(ctx, ipv4, whoami) },
+	probes := []struct {
+		name string
+		run  func() (netip.Addr, error)
+	}{
+		{"stun", func() (netip.Addr, error) { return discoverSTUN(ctx, ipv4, servers) }},
+		{"whoami", func() (netip.Addr, error) { return discoverWhoami(ctx, ipv4, whoami) }},
 	}
 	results := make(chan result, len(probes))
 	for _, probe := range probes {
 		go func() {
-			addr, err := probe()
-			results <- result{addr, err}
+			addr, err := probe.run()
+			results <- result{addr: addr, err: err, source: probe.name}
 		}()
 	}
 
@@ -286,11 +329,11 @@ func discoverPrefix(ctx context.Context, ipv4 bool) (netip.Prefix, error) {
 	for range probes {
 		got := <-results
 		if got.err == nil {
-			return maskPrefix(got.addr), nil
+			return maskPrefix(got.addr), got.source, nil
 		}
 		errs = append(errs, got.err)
 	}
-	return netip.Prefix{}, errors.Join(errs...)
+	return netip.Prefix{}, "", errors.Join(errs...)
 }
 
 func maskPrefix(addr netip.Addr) netip.Prefix {
@@ -330,6 +373,8 @@ var (
 // SetPrefixForTest overrides the discovered prefixes. It exists for tests in
 // packages that consume [Prefix] without running STUN discovery.
 func SetPrefixForTest(v4, v6 netip.Prefix) {
+	mu.Lock()
+	defer mu.Unlock()
 	prefix4.Store(v4)
 	prefix6.Store(v6)
 }

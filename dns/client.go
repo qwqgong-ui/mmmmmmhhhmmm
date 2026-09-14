@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/component/diagstats"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -62,8 +63,11 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 
 		// Resolvers MUST resend queries over TCP if they receive a truncated UDP response (with TC=1 set)!
 		if msg != nil && msg.Truncated && network == "udp" {
+			diagstats.Add(diagstats.DNSTCPRetry)
 			network = "tcp"
-			log.Debugln("[DNS] Truncated reply from %s:%s for %s over UDP, retrying over TCP", c.host, c.port, m.Question[0].String())
+			if log.Enabled(log.DEBUG) {
+				log.Fields(log.DEBUG, map[string]string{"subsystem": "dns", "event": "tcp_retry", "host": msgToDomain(m), "reason": "truncated_udp"}, "[DNS] TC=1 from %s:%s for %s; retrying over TCP", c.host, c.port, m.Question[0].String())
+			}
 			var tcpConn net.Conn
 			tcpConn, err = c.dialer.DialContext(ctx, network, addr)
 			if err != nil {

@@ -2,9 +2,8 @@ package cachefile
 
 import (
 	"encoding/binary"
+	"errors"
 	"time"
-
-	"github.com/metacubex/mihomo/log"
 
 	"github.com/metacubex/bbolt"
 )
@@ -26,14 +25,14 @@ type DNSEntry struct {
 // The whole snapshot is written in a single transaction: the cache holds up to
 // cache-max-size entries, and writing them one at a time would turn an hourly
 // save into tens of thousands of bbolt commits.
-func (c *CacheFile) SetDNSCache(entries []DNSEntry) {
+func (c *CacheFile) SetDNSCache(entries []DNSEntry) error {
 	if c.DB == nil {
-		return
+		return errors.New("cache database unavailable")
 	}
 
 	// Update, not Batch: Batch defers the commit to coalesce callers, and the
 	// shutdown path exits before that fires, so the snapshot was silently lost.
-	err := c.DB.Update(func(t *bbolt.Tx) error {
+	return c.DB.Update(func(t *bbolt.Tx) error {
 		if err := t.DeleteBucket(bucketDNSCache); err != nil && err != bbolt.ErrBucketNotFound {
 			return err
 		}
@@ -50,20 +49,22 @@ func (c *CacheFile) SetDNSCache(entries []DNSEntry) {
 		}
 		return nil
 	})
-	if err != nil {
-		log.Warnln("[CacheFile] store DNS cache error: %s", err.Error())
-	}
 }
 
 // DNSCache returns every persisted DNS answer. A malformed record is dropped
 // rather than failing the whole restore.
 func (c *CacheFile) DNSCache() []DNSEntry {
+	entries, _ := c.ReadDNSCache()
+	return entries
+}
+
+func (c *CacheFile) ReadDNSCache() ([]DNSEntry, error) {
 	if c.DB == nil {
-		return nil
+		return nil, errors.New("cache database unavailable")
 	}
 
 	var entries []DNSEntry
-	c.DB.View(func(t *bbolt.Tx) error {
+	err := c.DB.View(func(t *bbolt.Tx) error {
 		bucket := t.Bucket(bucketDNSCache)
 		if bucket == nil {
 			return nil
@@ -82,7 +83,7 @@ func (c *CacheFile) DNSCache() []DNSEntry {
 			return nil
 		})
 	})
-	return entries
+	return entries, err
 }
 
 // FlushDNSCache drops the persisted DNS cache.

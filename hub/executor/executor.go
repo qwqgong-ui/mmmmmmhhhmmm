@@ -248,6 +248,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil
 		resolver.DefaultService = nil
+		dns.RegisterDiagnosticService(nil)
 		resolver.ProxyServerHostResolver = nil
 		resolver.DirectHostResolver = nil
 		resolver.BootstrapResolver = nil
@@ -293,6 +294,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, r.DirectResolver.Resolver, c.CacheAlgorithm, c.CacheMaxSize)
 	}
 	s := dns.NewService(r, serviceResolver, m)
+	dns.RegisterDiagnosticService(serviceResolver)
 
 	resolver.DefaultResolver = r
 	resolver.DefaultHostMapper = m

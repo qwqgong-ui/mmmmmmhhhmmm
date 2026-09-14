@@ -43,6 +43,19 @@ func TestTCPConcurrentCacheLifecycle(t *testing.T) {
 	}
 }
 
+func TestTCPWinnerSnapshotsDecodeScopedKey(t *testing.T) {
+	cache := NewTCPConcurrentCache(4, time.Minute)
+	key, ok := tcpConcurrentCacheScopedKey("Example.Test", "443", "tcp", "wlan0|192.168.0.0/16")
+	if !ok {
+		t.Fatal("failed to build cache key")
+	}
+	cache.SetWithRTT(key, netip.MustParseAddr("192.0.2.10"), 12*time.Millisecond)
+	snapshots := cache.Snapshots("example.test")
+	if len(snapshots) != 1 || snapshots[0].Host != "example.test" || snapshots[0].Port != "443" || snapshots[0].NetworkScope != "wlan0|192.168.0.0/16" || snapshots[0].RTTMillis != 12 {
+		t.Fatalf("snapshots = %#v", snapshots)
+	}
+}
+
 func TestTCPConcurrentCacheExpirationAndRefresh(t *testing.T) {
 	cache := NewTCPConcurrentCache(2, 30*time.Minute)
 	now := time.Date(2026, time.August, 12, 0, 0, 0, 0, time.UTC)

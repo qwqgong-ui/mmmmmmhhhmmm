@@ -2,10 +2,13 @@ package process
 
 import (
 	"errors"
+	"fmt"
 	"net/netip"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/component/diagstats"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
 
 var (
@@ -70,7 +73,21 @@ func FindProcessNameByAddr(network string, src, dst netip.AddrPort) (uint32, str
 
 // FindProcessNameByAddrWithMatcher limits expensive process descriptor scans
 // to executable paths that can match the active process rules.
-func FindProcessNameByAddrWithMatcher(network string, src, dst netip.AddrPort, matcher ProcessMatcher) (uint32, string, error) {
+func FindProcessNameByAddrWithMatcher(network string, src, dst netip.AddrPort, matcher ProcessMatcher) (uid uint32, path string, err error) {
+	defer func() {
+		if err != nil {
+			diagstats.Add(diagstats.ProcessFallback)
+		} else {
+			diagstats.Add(diagstats.ProcessFound)
+		}
+		if log.Enabled(log.DEBUG) {
+			reason := "matched"
+			if err != nil {
+				reason = err.Error()
+			}
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "process", "event": "attribution", "endpoint": src.String(), "destination": dst.String(), "reason": reason, "uid": fmt.Sprint(uid)}, "Process %s %s -> %s path=%s result=%s", network, src, dst, path, reason)
+		}
+	}()
 	if resolver := externalEndpointResolver.Load(); resolver != nil {
 		return resolver(network, src, dst)
 	}

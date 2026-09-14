@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/component/diagstats"
+	"github.com/metacubex/mihomo/log"
 )
 
 const (
@@ -112,6 +114,18 @@ type TCPConcurrentCache struct {
 	entries *lru.LruCache[string, tcpConcurrentCacheEntry]
 	ttl     time.Duration
 	now     func() time.Time
+}
+
+type TCPWinnerSnapshot struct {
+	Host         string    `json:"host"`
+	Port         string    `json:"port"`
+	Network      string    `json:"network"`
+	NetworkScope string    `json:"networkScope,omitempty"`
+	IP           string    `json:"ip"`
+	RTTMillis    int64     `json:"rttMs,omitempty"`
+	Rank         int       `json:"rank"`
+	RTTKnown     bool      `json:"rttKnown"`
+	ExpiresAt    time.Time `json:"expiresAt"`
 }
 
 // NewTCPConcurrentCache creates a bounded winner cache. Non-positive values
@@ -240,6 +254,7 @@ func (c *TCPConcurrentCache) Remove(key string, winner netip.Addr) {
 		return
 	}
 	winner = winner.Unmap()
+	removed, destinationInvalid := false, false
 	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
 		if !loaded {
 			return current, true
@@ -247,12 +262,50 @@ func (c *TCPConcurrentCache) Remove(key string, winner netip.Addr) {
 		remaining := slices.DeleteFunc(slices.Clone(current.winners), func(held tcpConcurrentWinner) bool {
 			return held.IP == winner
 		})
+		removed = len(remaining) != len(current.winners)
 		if len(remaining) == 0 {
+			destinationInvalid = removed
 			return tcpConcurrentCacheEntry{}, true
 		}
 		current.winners = remaining
 		return current, false
 	})
+	if removed {
+		diagstats.Add(diagstats.DirectWinnerEvicted)
+		event := "winner_evicted"
+		if destinationInvalid {
+			event = "destination_invalidated"
+		}
+		if destinationInvalid && shouldLogTCPWinnerChange(key, event) {
+			log.Fields(log.INFO, map[string]string{"subsystem": "direct", "event": event, "host": tcpWinnerHost(key), "reason": "connect_failed"}, "DIRECT TCP winner destination invalidated %s (failed=%s)", tcpWinnerHost(key), winner)
+		} else if log.Enabled(log.DEBUG) {
+			log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": event, "host": tcpWinnerHost(key), "reason": "connect_failed"}, "DIRECT TCP cached winner evicted %s --> %s (destination invalid=%t)", tcpWinnerHost(key), winner, destinationInvalid)
+		}
+	}
+}
+
+func shouldLogTCPWinnerChange(key, event string) bool {
+	now := time.Now()
+	logKey := key + "\x00" + event
+	allowed := false
+	tcpWinnerLogTimes.Compute(logKey, func(last time.Time, loaded bool) (time.Time, bool) {
+		if loaded && now.Sub(last) < time.Minute {
+			return last, false
+		}
+		allowed = true
+		return now, false
+	})
+	return allowed
+}
+
+func tcpWinnerHost(key string) string {
+	base, _, _ := strings.Cut(key, "\x00")
+	address, _, _ := strings.Cut(base, "/")
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return address
+	}
+	return host
 }
 
 // Delete removes a destination from the cache.
@@ -272,11 +325,55 @@ func (c *TCPConcurrentCache) Clear() {
 }
 
 var tcpConcurrentCache = NewTCPConcurrentCache(0, 0)
+var tcpWinnerLogTimes = lru.New(lru.WithSize[string, time.Time](defaultTCPConcurrentCacheSize))
 
 // ClearTCPConcurrentCache clears the winner cache without changing DNS cache
 // entries or DNS semantics.
 func ClearTCPConcurrentCache() {
 	tcpConcurrentCache.Clear()
+}
+
+func TCPWinnerSnapshots(host string) []TCPWinnerSnapshot {
+	return tcpConcurrentCache.Snapshots(host)
+}
+
+func (c *TCPConcurrentCache) Snapshots(host string) []TCPWinnerSnapshot {
+	if c == nil {
+		return nil
+	}
+	host = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(host)), ".")
+	now := c.now()
+	result := make([]TCPWinnerSnapshot, 0)
+	for _, item := range c.entries.Snapshot() {
+		if !now.Before(item.Value.expireAt) {
+			continue
+		}
+		base, scope, _ := strings.Cut(item.Key, "\x00")
+		address, network, ok := strings.Cut(base, "/")
+		cachedHost, port, err := net.SplitHostPort(address)
+		if !ok || err != nil || (host != "" && cachedHost != host) {
+			continue
+		}
+		for rank, winner := range item.Value.winners {
+			result = append(result, TCPWinnerSnapshot{Host: cachedHost, Port: port, Network: network, NetworkScope: scope, IP: winner.IP.String(), RTTMillis: winner.RTT.Milliseconds(), RTTKnown: winner.RTT > 0, Rank: rank + 1, ExpiresAt: item.Value.expireAt})
+		}
+	}
+	slices.SortFunc(result, func(a, b TCPWinnerSnapshot) int {
+		if n := cmp.Compare(a.Host, b.Host); n != 0 {
+			return n
+		}
+		if n := cmp.Compare(a.Port, b.Port); n != 0 {
+			return n
+		}
+		if n := cmp.Compare(a.NetworkScope, b.NetworkScope); n != 0 {
+			return n
+		}
+		if n := cmp.Compare(a.Network, b.Network); n != 0 {
+			return n
+		}
+		return cmp.Compare(a.Rank, b.Rank)
+	})
+	return result
 }
 
 func tcpConcurrentCacheKey(host, port, network string) (string, bool) {
@@ -325,6 +422,11 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 	// budget, in order, before the full race starts. One withdrawn CDN node
 	// then costs a single extra connect instead of a restart from scratch.
 	winners, loaded := tcpConcurrentCache.Winners(key)
+	if loaded {
+		diagstats.Add(diagstats.DirectWinnerHit)
+	} else {
+		diagstats.Add(diagstats.DirectWinnerMiss)
+	}
 	if loaded {
 		winners = slices.DeleteFunc(winners, func(winner tcpConcurrentWinner) bool {
 			return !containsTCPConcurrentCandidate(ips, winner.IP)

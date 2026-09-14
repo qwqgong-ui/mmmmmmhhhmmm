@@ -45,7 +45,7 @@ func newDomainClient(public dnsClient, direct directExchanger, size int) *domain
 	if size <= 0 {
 		size = 1024
 	}
-	return &domainClient{public: public, direct: direct, bundles: tunneldns.NewRegistry(), cache: lru.New(lru.WithSize[domainKey, *D.Msg](size)), prepare: tunnel.PrepareTunnelDNS}
+	return &domainClient{public: public, direct: direct, bundles: tunneldns.NewRegistryFor("domain_bundle"), cache: lru.New(lru.WithSize[domainKey, *D.Msg](size)), prepare: tunnel.PrepareTunnelDNS}
 }
 
 func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.Msg, error) {
@@ -140,6 +140,7 @@ func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.
 		if msg.Rcode != D.RcodeSuccess || msg.Truncated {
 			return nil, errors.New("incomplete domain bundle")
 		}
+		c.bundles.MarkSupported(node)
 		ttl := uint32(^uint32(0))
 		foundAddress := false
 		for _, rr := range append(append([]D.RR{}, msg.Answer...), msg.Extra...) {

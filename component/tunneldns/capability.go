@@ -10,8 +10,11 @@
 package tunneldns
 
 import (
+	"sort"
 	"sync"
 	"time"
+
+	"github.com/metacubex/mihomo/log"
 )
 
 // UnsupportedTTL is how long a node that could not answer is left alone.
@@ -20,13 +23,26 @@ const UnsupportedTTL = 5 * time.Minute
 // Registry records per node whether the reserved destination is served there.
 type Registry struct {
 	mu    sync.RWMutex
-	nodes map[string]time.Time // node -> when an unsupported verdict expires
+	nodes map[string]Capability
 	now   func() time.Time
+	kind  string
+}
+
+type Capability struct {
+	Kind      string    `json:"capability"`
+	Node      string    `json:"node"`
+	State     string    `json:"state"`
+	LastProbe time.Time `json:"lastProbe"`
+	ExpiresAt time.Time `json:"expiresAt,omitempty"`
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
-	return &Registry{nodes: make(map[string]time.Time), now: time.Now}
+	return NewRegistryFor("server_dns")
+}
+
+func NewRegistryFor(kind string) *Registry {
+	return &Registry{nodes: make(map[string]Capability), now: time.Now, kind: kind}
 }
 
 var defaultRegistry = NewRegistry()
@@ -38,21 +54,24 @@ func (r *Registry) Supported(node string) bool {
 		return true
 	}
 	r.mu.RLock()
-	until, known := r.nodes[node]
+	entry, known := r.nodes[node]
 	r.mu.RUnlock()
-	if !known {
+	if !known || entry.State != "unsupported" {
 		return true
 	}
-	if r.now().Before(until) {
+	if r.now().Before(entry.ExpiresAt) {
 		return false
 	}
 	// The verdict has expired: forget it so the node is tried again.
 	r.mu.Lock()
-	if expiry, still := r.nodes[node]; still && !r.now().Before(expiry) {
-		delete(r.nodes, node)
+	if current, still := r.nodes[node]; still && current.State == "unsupported" && !r.now().Before(current.ExpiresAt) {
+		current.State = "expired"
+		r.nodes[node] = current
+		log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "server_capability_expired", "proxy": node, "capability": r.kind, "reason": "retry_after_ttl"}, "[DNS] %s capability expired for %s; testing again on demand", r.kind, node)
 	}
+	allowed := r.nodes[node].State != "unsupported"
 	r.mu.Unlock()
-	return true
+	return allowed
 }
 
 // MarkSupported records that node answered.
@@ -60,9 +79,7 @@ func (r *Registry) MarkSupported(node string) {
 	if node == "" {
 		return
 	}
-	r.mu.Lock()
-	delete(r.nodes, node)
-	r.mu.Unlock()
+	r.mark(node, "supported")
 }
 
 // MarkUnsupported records that node could not answer, for UnsupportedTTL.
@@ -70,10 +87,39 @@ func (r *Registry) MarkUnsupported(node string) {
 	if node == "" {
 		return
 	}
-	r.mu.Lock()
-	r.nodes[node] = r.now().Add(UnsupportedTTL)
-	r.mu.Unlock()
+	r.mark(node, "unsupported")
 }
+
+func (r *Registry) mark(node, state string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old := r.nodes[node]
+	entry := Capability{Kind: r.kind, Node: node, State: state, LastProbe: r.now()}
+	if state == "unsupported" {
+		entry.ExpiresAt = entry.LastProbe.Add(UnsupportedTTL)
+	}
+	r.nodes[node] = entry
+	if old.State != state {
+		log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "server_capability_changed", "proxy": node, "capability": r.kind, "reason": state}, "[DNS] %s capability for %s: %s -> %s", r.kind, node, old.State, state)
+	}
+}
+
+// Snapshot never expires a verdict as a side effect of reading diagnostics.
+func (r *Registry) Snapshot() []Capability {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	result := make([]Capability, 0, len(r.nodes))
+	for _, entry := range r.nodes {
+		if entry.State == "unsupported" && !r.now().Before(entry.ExpiresAt) {
+			entry.State = "expired"
+		}
+		result = append(result, entry)
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Node < result[j].Node })
+	return result
+}
+
+func Snapshot() []Capability { return defaultRegistry.Snapshot() }
 
 // Reset forgets every verdict. Configuration reloads replace the proxy set, so
 // what was learned about the old one no longer applies.
