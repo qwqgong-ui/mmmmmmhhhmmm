@@ -3,6 +3,7 @@ package androidcyaml
 import (
 	"syscall"
 
+	"github.com/metacubex/mihomo/component/dev_cache"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -10,8 +11,8 @@ import (
 	"github.com/metacubex/mihomo/hub/executor"
 )
 
-// SetDirectNetworkEnvironment selects the network-scoped branch of the direct
-// DNS candidate cache.
+// SetDirectNetworkEnvironment selects the network partition of all dev_cache
+// answers, proxy bundles and TCP winners.
 //
 // Android cannot let the Go side discover the physical path itself, so
 // AndroidCyaml supplies a privacy-preserving fingerprint of the current Wi-Fi or
@@ -22,7 +23,7 @@ func SetDirectNetworkEnvironment(environment string) {
 	dialer.SetDirectNetworkEnvironment(environment)
 }
 
-// RetireNetworkScope drops the direct DNS candidates belonging to a network the
+// RetireNetworkScope drops all dev_cache entries belonging to a network the
 // platform has stopped tracking, and reports how many entries were removed.
 //
 // Scoped keys keep a handover cheap: nothing is cleared, because each network's
@@ -67,10 +68,9 @@ func FlushInterfaceCache() {
 	iface.FlushCache()
 }
 
-// ClearVolatileDNSCache drops ordinary answers and DNS transports while
-// preserving the long-lived per-network candidate branches, which are scoped and
-// therefore still correct for the networks they belong to.
+// ClearVolatileDNSCache requests refresh without discarding retained answers.
 func ClearVolatileDNSCache() {
+	dev_cache.RefreshScope(dev_cache.CurrentScope())
 	resolver.ClearVolatileCache()
 }
 
@@ -78,6 +78,7 @@ func ClearVolatileDNSCache() {
 // is memory reclamation, not a handover step.
 func ClearDNSCache() {
 	resolver.ClearCache()
+	dns.FlushDevCache()
 }
 
 // ResetDNSConnections closes pooled resolver connections bound to a path that no

@@ -33,6 +33,7 @@ Go module，因此它们的补丁继续保存在 `patches/` 下并由构建流�
 - [代理提供者健康检查探测间隔控制（Provider Health-Check Probe Pacing）](features/provider-health-check-probe-pacing.md)
 - [通用混合 QUIC（Generic Hybrid QUIC）](features/generic-hybrid-quic.md)
 - [运行时诊断与结构化状态日志](features/runtime-diagnostics.md)
+- [dev_cache 统一缓存、刷新与网络隔离](features/dev-cache.md)
 - [AndroidCyaml 集成（AndroidCyaml Integration）](features/androidcyaml-integration.md)
 - [HY2 支持 ECN 反馈的 BBR（HY2 ECN-Aware BBR）](features/hy2-ecn-aware-bbr.md)
 - [HY2 使用 QUIC v2（HY2 QUIC v2）](features/hy2-quic-v2.md)

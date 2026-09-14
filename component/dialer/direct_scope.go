@@ -3,10 +3,10 @@ package dialer
 import (
 	"net"
 	"net/netip"
-	"sort"
 	"strings"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/component/dev_cache"
 	"github.com/metacubex/mihomo/log"
 )
 
@@ -18,10 +18,10 @@ var directNetworkEnvironment = atomic.NewTypedValue[string]("")
 func SetDirectNetworkEnvironment(environment string) {
 	environment = strings.TrimSpace(environment)
 	old := directNetworkEnvironment.Swap(environment)
-	if old == environment {
-		return
+	dev_cache.SetEnvironment(environment)
+	if old != environment {
+		log.Fields(log.INFO, map[string]string{"subsystem": "network", "event": "scope_changed", "network_scope": EnvironmentScope(environment), "old_network_scope": EnvironmentScope(old), "reason": "platform_update"}, "Network cache partition changed")
 	}
-	log.Fields(log.INFO, map[string]string{"subsystem": "network", "event": "scope_changed", "network_scope": EnvironmentScope(environment), "old_network_scope": EnvironmentScope(old), "reason": "platform_update"}, "Network scope changed: %s -> %s", EnvironmentScope(old), EnvironmentScope(environment))
 }
 
 type NetworkStatus struct {
@@ -35,14 +35,7 @@ type NetworkStatus struct {
 
 func CurrentNetworkStatus() NetworkStatus {
 	name := currentInterfaceName("")
-	status := NetworkStatus{Interface: name, NetworkScope: "default"}
-	if name != "" {
-		status.NetworkScope = name
-	}
-	environment := EnvironmentScope(directNetworkEnvironment.Load())
-	if environment != "" {
-		status.NetworkScope = environment
-	}
+	status := NetworkStatus{Interface: name, NetworkScope: directNetworkScope(option{})}
 	if name == "" {
 		status.Reason = "physical_interface_unknown"
 		return status
@@ -58,27 +51,24 @@ func CurrentNetworkStatus() NetworkStatus {
 		return status
 	}
 	status.AddressesKnown = true
-	prefixes := make([]netip.Prefix, 0, len(addresses))
 	for _, address := range addresses {
 		prefix, err := netip.ParsePrefix(address.String())
-		if err != nil || prefix.Addr().IsLoopback() || prefix.Addr().IsLinkLocalUnicast() {
+		if err != nil {
 			continue
 		}
-		prefixes = append(prefixes, prefix)
-		if prefix.Addr().Is4() {
+		ip := prefix.Addr()
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
+			continue
+		}
+		if ip.Is4() {
 			status.IPv4 = true
 		} else {
 			status.IPv6 = true
 		}
 	}
-	if environment == "" {
-		status.NetworkScope = scopeForPrefixes(name, prefixes)
-	}
 	return status
 }
 
-// NetworkScope applies the outbound's interface choice when describing its
-// path, rather than mislabelling a bound socket with the default interface.
 func NetworkScope(options ...Option) string {
 	var opt option
 	for _, apply := range options {
@@ -86,6 +76,8 @@ func NetworkScope(options ...Option) string {
 	}
 	return directNetworkScope(opt)
 }
+
+func init() { dev_cache.SetDesktopScopeProvider(func() string { return directNetworkScope(option{}) }) }
 
 // environmentScopePrefix marks a scope the platform named rather than one
 // derived from local interfaces.
@@ -109,16 +101,16 @@ func directNetworkScope(opt option) string {
 	}
 	interfaceName := currentInterfaceName(opt.interfaceName)
 	if interfaceName == "" {
-		return "default"
+		return dev_cache.DesktopScope(nil)
 	}
 
 	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
-		return interfaceName
+		return dev_cache.DesktopScope(nil)
 	}
 	addresses, err := iface.Addrs()
 	if err != nil {
-		return interfaceName
+		return dev_cache.DesktopScope(nil)
 	}
 	prefixes := make([]netip.Prefix, 0, len(addresses))
 	for _, address := range addresses {
@@ -145,26 +137,7 @@ func currentInterfaceName(configured string) string {
 }
 
 func scopeForPrefixes(interfaceName string, prefixes []netip.Prefix) string {
-	parts := make([]string, 0, len(prefixes))
-	private192 := netip.MustParsePrefix("192.168.0.0/16")
-	for _, prefix := range prefixes {
-		addr := prefix.Addr().Unmap()
-		if !addr.IsValid() || addr.IsLoopback() || addr.IsLinkLocalUnicast() {
-			continue
-		}
-		if addr.Is4() && private192.Contains(addr) {
-			prefix = netip.PrefixFrom(addr, 16)
-		} else if addr != prefix.Addr() {
-			prefix = netip.PrefixFrom(addr, min(prefix.Bits(), addr.BitLen()))
-		}
-		parts = append(parts, prefix.Masked().String())
-	}
-	sort.Strings(parts)
-	parts = compactStrings(parts)
-	if len(parts) == 0 {
-		return interfaceName
-	}
-	return interfaceName + "|" + strings.Join(parts, ",")
+	return dev_cache.DesktopScope(prefixes)
 }
 
 func compactStrings(values []string) []string {

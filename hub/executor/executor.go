@@ -258,6 +258,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	ipv6 := c.IPv6 && generalIPv6
 	r := dns.NewResolver(dns.Config{
+		CacheIdentity:        c.CacheIdentity,
 		Main:                 c.NameServer,
 		Fallback:             c.Fallback,
 		IPv6:                 ipv6,
@@ -274,6 +275,9 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		CacheAlgorithm:       c.CacheAlgorithm,
 		CacheMaxSize:         c.CacheMaxSize,
 	})
+	// Attach retained stores before these resolver pointers become visible to
+	// queries. Reattaching after ReCreateServer races with the first requests.
+	dns.RegisterPersistentCaches(r)
 	m := dns.NewEnhancer(dns.EnhancerConfig{
 		IPv6:          ipv6,
 		EnhancedMode:  c.EnhancedMode,
@@ -291,7 +295,7 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 
 	var serviceResolver resolver.Resolver
 	if m.FakeIPEnabled() {
-		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, r.DirectResolver.Resolver, c.CacheAlgorithm, c.CacheMaxSize)
+		serviceResolver = dns.NewFakeIPServiceResolver(c.DefaultNameserver, r.DirectResolver.Resolver, c.CacheAlgorithm, c.CacheMaxSize, c.CacheIdentity)
 	}
 	s := dns.NewService(r, serviceResolver, m)
 	dns.RegisterDiagnosticService(serviceResolver)
@@ -322,10 +326,6 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	lc := inbound.NewListenConfig()
 	lc.SetRouteMark(c.ListenRoutingMark)
 	dns.ReCreateServer(c.Listen, lc, s)
-
-	// The runtime's own resolvers are the set persisted to the cache file;
-	// an outbound's private resolver must never take their place.
-	dns.RegisterPersistentCaches(r)
 
 	// after the resolvers are in place: STUN server names are resolved
 	// through the direct resolver

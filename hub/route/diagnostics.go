@@ -264,14 +264,14 @@ func debugPath(w http.ResponseWriter, r *http.Request) {
 		known = true
 	}
 	for _, entry := range entries {
-		if !route.Complete || entry.State != "fresh" {
+		if !route.Complete || !entry.Usable {
 			continue
 		}
 		if route.DNSSource == "direct" {
 			if !strings.HasPrefix(entry.Resolver, "direct") || (progressive && entry.NetworkScope != state.NetworkScope) || (!progressive && entry.NetworkScope != "" && entry.NetworkScope != state.NetworkScope) {
 				continue
 			}
-		} else if port != 443 || entry.Source != "server-dns" || entry.Node != route.Leaf {
+		} else if port != 443 || entry.Source != "server-dns" || entry.Node != route.Leaf || entry.NetworkScope != state.NetworkScope {
 			continue
 		}
 		if len(entry.Addresses) == 0 {
@@ -295,6 +295,6 @@ func debugPath(w http.ResponseWriter, r *http.Request) {
 		"networkState": state, "ipv6State": executor.IPv6Status(), "ecs": ecs.Snapshot(),
 		"dns":     render.M{"fakeIPEnabled": fakeIP, "ipv4Candidates": ipv4, "ipv6Candidates": ipv6, "candidatesKnown": known, "cache": entries, "queries": queries, "capabilities": dns.CapabilitySnapshots()},
 		"winners": winnerDiagnostics(host), "hybridQuic": render.M{"flows": hybrid.FlowSnapshotsFor(host, strconv.Itoa(int(port)), "")},
-		"notes": []string{"Rule preview has no source socket, process or inbound identity; group choice may change before a real connection", "Only matching fresh direct-scope or selected-node bundle addresses are candidates; no cache means unknown", "dns_service queries show actual client-facing A/AAAA/HTTPS/SVCB, including Fake-IP rewriting; cached bindings are upstream observations", "AD and RRSIG presence is observed, not independently validated; active queries can warm the normal DNS cache"},
+		"notes": []string{"Rule preview has no source socket, process or inbound identity; group choice may change before a real connection", "Matching retained direct-scope or selected-node addresses remain candidates after their refresh deadline; no cache means unknown", "dns_service queries show actual client-facing A/AAAA/HTTPS/SVCB, including Fake-IP rewriting; cached bindings are upstream observations", "AD and RRSIG presence is observed, not independently validated; active queries can warm the normal DNS cache"},
 	})
 }

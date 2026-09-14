@@ -45,7 +45,7 @@ func directProgressiveDialContext(ctx context.Context, network, address string, 
 		return nil, err
 	}
 	scope := directNetworkScope(opt)
-	cacheKey, cacheable := tcpConcurrentCacheScopedKey(host, port, network, scope)
+	cacheKey, cacheable := tcpConcurrentPathKey(host, port, network, scope, opt)
 	if !cacheable {
 		cacheKey = ""
 	}
@@ -156,7 +156,7 @@ func runProgressiveDirectRace(
 					winner.IP.Is6() && (network == "tcp4" || R.DisableIPv6.Load())
 			})
 			if len(cachedWinners) == 0 {
-				tcpConcurrentCache.Delete(cacheKey)
+				// Keep retained hints for other families and pending DNS sources.
 				cachePending = false
 			} else {
 				// The fast path is armed by one family's DNS batch, and a
@@ -371,7 +371,7 @@ func runProgressiveDirectRace(
 				if cachePending && event.ipv6 == cachedIPv6 {
 					// That family produced nothing to validate the winners
 					// against, so they cannot be trusted for this network.
-					tcpConcurrentCache.Delete(cacheKey)
+					// Keep retained hints for other families and pending DNS sources.
 					abandonFastPath()
 				}
 				doneFamilies++
@@ -410,7 +410,7 @@ func runProgressiveDirectRace(
 						startFastGroup(fastWinners, event.ipv6)
 					} else {
 						log.Debugln("[TCP] progressive direct cache expired %s:%s; racing current candidates", host, port)
-						tcpConcurrentCache.Delete(cacheKey)
+						// Keep retained hints for other families and pending DNS sources.
 						abandonFastPath()
 					}
 				}
@@ -436,7 +436,7 @@ func runProgressiveDirectRace(
 				if result.error != nil {
 					log.Debugln("[TCP] progressive direct cached connect failed %s:%s --> %s: %v", host, port, result.ip, result.error)
 					errs = append(errs, fmt.Errorf("cached connect %s failed: %w", result.ip, result.error))
-					tcpConcurrentCache.Remove(cacheKey, result.ip)
+					tcpConcurrentCache.Backoff(cacheKey, result.ip)
 					// Only the last cached winner to fail releases the field:
 					// while another is still dialing, it may yet answer.
 					if fastPriority && len(fastInFlight) == 0 {
@@ -499,7 +499,7 @@ func runProgressiveDirectRace(
 			// Whatever has not answered by now does not deserve to be tried
 			// first again, whether or not one of its peers already won.
 			for _, ip := range fastInFlight {
-				tcpConcurrentCache.Remove(cacheKey, ip)
+				tcpConcurrentCache.Backoff(cacheKey, ip)
 			}
 			if !fastPriority {
 				stopFastTimer()

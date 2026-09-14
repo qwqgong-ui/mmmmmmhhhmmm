@@ -88,7 +88,7 @@ func TestProgressiveDirectReturnsFirstDNSRaceAndAcceptsLaterFasterSource(t *test
 		t.Fatal("later DNS source did not refresh the TCP winner")
 	}
 
-	key, ok := tcpConcurrentCacheScopedKey("race.example", "443", "tcp", "default")
+	key, ok := tcpConcurrentCacheScopedKey("race.example", "443", "tcp", directNetworkScope(option{}))
 	if !ok {
 		t.Fatal("missing TCP winner cache key")
 	}
@@ -285,7 +285,7 @@ func TestScopeForPrefixesUsesRequestedPrivate16Boundary(t *testing.T) {
 	scopeA := scopeForPrefixes("wlan0", []netip.Prefix{netip.MustParsePrefix("192.168.12.34/24")})
 	scopeB := scopeForPrefixes("wlan0", []netip.Prefix{netip.MustParsePrefix("192.168.99.8/24")})
 	scopeC := scopeForPrefixes("wlan0", []netip.Prefix{netip.MustParsePrefix("192.169.1.8/24")})
-	if scopeA != "wlan0|192.168.0.0/16" || scopeB != scopeA {
+	if scopeA != "ipv4-private|192.168.0.0/16" || scopeB != scopeA {
 		t.Fatalf("192.168 /16 scopes: A=%q B=%q", scopeA, scopeB)
 	}
 	if scopeC == scopeA {

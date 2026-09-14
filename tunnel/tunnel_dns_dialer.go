@@ -59,6 +59,16 @@ func DialTunnelDNS(ctx context.Context, queryDomain string) (net.Conn, string, e
 // PrepareTunnelDNS pins the selected leaf before cache lookup and dialing.
 // Reusing the group for dialing could select a different node for the reserved name.
 func PrepareTunnelDNS(queryDomain string) (string, func(context.Context) (net.Conn, error), error) {
+	return prepareTunnelDNS(queryDomain, false)
+}
+
+// PrepareTunnelDNSCache pins a leaf without making capability backoff a cache
+// lookup failure. The cache owner gates cold work and coordinates warm retries.
+func PrepareTunnelDNSCache(queryDomain string) (string, func(context.Context) (net.Conn, error), error) {
+	return prepareTunnelDNS(queryDomain, true)
+}
+
+func prepareTunnelDNS(queryDomain string, cacheOwner bool) (string, func(context.Context) (net.Conn, error), error) {
 	match, err := tunnelDNSMatchTarget(queryDomain)
 	if err != nil {
 		return "", nil, err
@@ -71,10 +81,15 @@ func PrepareTunnelDNS(queryDomain string) (string, func(context.Context) (net.Co
 		return "", nil, fmt.Errorf("%w: %s matched no proxy", ErrTunnelDNSUnsupported, queryDomain)
 	}
 	node := leafProxy(proxy, match)
-	if err := tunnelDNSNodeUsable(node); err != nil {
+	if err := tunnelDNSNodeUsable(node); err != nil && (!cacheOwner || node.Type() == C.Direct || !node.Type().CanServeTunnelDNS()) {
 		return node.Name(), nil, err
 	}
 	return node.Name(), func(ctx context.Context) (net.Conn, error) {
+		// Capability backoff limits network work, never access to a retained
+		// bundle. Return the pinned identity before checking this condition.
+		if err := tunnelDNSNodeUsable(node); err != nil && !cacheOwner {
+			return nil, err
+		}
 		metadata := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
 		if err := metadata.SetRemoteAddress(C.TunnelDNSAddress); err != nil {
 			return nil, err

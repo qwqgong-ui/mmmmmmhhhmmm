@@ -112,6 +112,10 @@ func TestDirectCandidatesStaleCachePublishesTwoSourcesIndependently(t *testing.T
 	r.cache.SetWithExpire(key, directAnswer(staleQuery, "192.0.2.9", 60), time.Now().Add(-time.Second))
 
 	batches := r.LookupIPCandidates(context.Background(), "stale.example", false, scope)
+	retained := <-batches
+	if retained.Source != -1 || !containsAddr(retained.IPs, netip.MustParseAddr("192.0.2.9")) {
+		t.Fatalf("missing retained batch: %+v", retained)
+	}
 	close(release1)
 	first := <-batches
 	if first.Source != 0 || len(first.IPs) != 1 || first.IPs[0] != netip.MustParseAddr("192.0.2.1") {
@@ -119,7 +123,7 @@ func TestDirectCandidatesStaleCachePublishesTwoSourcesIndependently(t *testing.T
 	}
 	close(release2)
 	second := <-batches
-	if second.Source != 1 || len(second.IPs) != 2 || second.IPs[0] != netip.MustParseAddr("192.0.2.1") || second.IPs[1] != netip.MustParseAddr("192.0.2.2") {
+	if second.Source != 1 || len(second.IPs) != 1 || second.IPs[0] != netip.MustParseAddr("192.0.2.2") {
 		t.Fatalf("second batch: %+v", second)
 	}
 	if _, open := <-batches; open {
@@ -134,9 +138,9 @@ func TestDirectCandidatesStaleCachePublishesTwoSourcesIndependently(t *testing.T
 	}
 
 	r.PromoteIP("stale.example", false, scope, netip.MustParseAddr("192.0.2.1"))
-	winner, _, hit := r.cache.GetWithExpire(key)
-	if !hit || len(msgToIP(winner)) != 1 || msgToIP(winner)[0] != netip.MustParseAddr("192.0.2.1") {
-		t.Fatalf("ordinary winner cache = %v, hit=%v", msgToIP(winner), hit)
+	winner, due, hit := r.cache.GetWithExpire(key)
+	if !hit || msgToIP(winner)[0] != netip.MustParseAddr("192.0.2.9") || time.Now().Before(due) {
+		t.Fatal("TCP winner renewed or replaced a DNS answer")
 	}
 }
 
@@ -162,7 +166,7 @@ func TestDirectCandidatesStaleCachePublishesSourceCacheBeforeRefresh(t *testing.
 		r.sourceCaches[source].SetWithExpire(
 			r.directSourceCacheKey(key, source),
 			directAnswer(query, ip, 60),
-			time.Now().Add(time.Hour),
+			time.Now().Add(-365*24*time.Hour),
 		)
 	}
 
@@ -189,7 +193,7 @@ func TestDirectCandidatesStaleCachePublishesSourceCacheBeforeRefresh(t *testing.
 		if batch.Err != nil {
 			t.Fatal(batch.Err)
 		}
-		refreshed = batch.IPs
+		refreshed = append(refreshed, batch.IPs...)
 	}
 	if !containsAddr(refreshed, netip.MustParseAddr("192.0.2.11")) ||
 		!containsAddr(refreshed, netip.MustParseAddr("192.0.2.12")) {
@@ -221,8 +225,11 @@ func TestDirectCandidatesSourceCacheIsNetworkScoped(t *testing.T) {
 	batches := r.LookupIPCandidates(context.Background(), "scoped.example", false, newScope)
 	select {
 	case batch := <-batches:
-		t.Fatalf("different-network source cache was published: %+v", batch)
+		if containsAddr(batch.IPs, netip.MustParseAddr("192.0.2.1")) || !containsAddr(batch.IPs, netip.MustParseAddr("192.0.2.9")) {
+			t.Fatalf("wrong network's retained data: %+v", batch)
+		}
 	case <-time.After(25 * time.Millisecond):
+		t.Fatal("current network's retained answer waited for DNS")
 	}
 	close(release)
 	for range batches {

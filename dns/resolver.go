@@ -2,13 +2,14 @@ package dns
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
+	"fmt"
 	"net/netip"
+	"strings"
 	"time"
 
-	"github.com/metacubex/mihomo/common/arc"
-	"github.com/metacubex/mihomo/common/lru"
-	"github.com/metacubex/mihomo/common/singleflight"
+	"github.com/metacubex/mihomo/component/dev_cache"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/trie"
 	C "github.com/metacubex/mihomo/constant"
@@ -25,11 +26,7 @@ type dnsClient interface {
 	ResetConnection()
 }
 
-type dnsCache interface {
-	GetWithExpire(key string) (*D.Msg, time.Time, bool)
-	SetWithExpire(key string, value *D.Msg, expire time.Time)
-	Clear()
-}
+type dnsCache = *dev_cache.Cache[string, *D.Msg]
 
 type result struct {
 	Msg   *D.Msg
@@ -37,6 +34,7 @@ type result struct {
 }
 
 type Resolver struct {
+	cacheIdentity         string
 	domainClient          *domainClient
 	ipv6                  bool
 	ipv6Timeout           time.Duration
@@ -45,7 +43,6 @@ type Resolver struct {
 	fallbackDomainFilters []C.DomainMatcher
 	fallbackIPFilters     []C.IpMatcher
 	fallbackLazyQuery     bool
-	group                 singleflight.Group[*D.Msg]
 	cache                 dnsCache
 	policy                []dnsPolicy
 	defaultResolver       *Resolver
@@ -157,122 +154,75 @@ func (r *Resolver) ResolveECH(ctx context.Context, host string) ([]byte, error) 
 	return nil, errors.New("no ECH config found in DNS records")
 }
 
-// ExchangeContext a batch of dns request with context.Context, and it use cache
-func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
-	if len(m.Question) == 0 {
-		return nil, errors.New("should have one question at least")
+// ExchangeContext returns retained answers immediately. A TTL is a refresh
+// deadline, never a local availability deadline.
+func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) {
+	if len(m.Question) != 1 {
+		return nil, errors.New("should have one question")
 	}
 	if r.domainClient != nil {
 		return r.domainClient.ExchangeContext(ctx, m)
 	}
-	continueFetch := false
-	defer func() {
-		if continueFetch || errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
-			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout)
-				defer cancel()
-				_, _ = r.exchangeWithoutCache(ctx, m) // ignore result, just for putMsgToCache
-			}()
-		}
-	}()
-
-	q := m.Question[0]
-	domain := msgToDomain(m)
-	msg, expireTime, hit := getMsgFromCache(r.cache, q)
-	if hit {
-		if log.Enabled(log.DEBUG) {
-			log.Debugln("[DNS] cache hit %s --> %s, expire at %s", domain, msgToLogString(msg), expireTime.Format("2006-01-02 15:04:05"))
-		}
-		now := time.Now()
-		if expireTime.Before(now) {
-			logDNSCache(q, "stale", "")
-			setMsgTTL(msg, uint32(3)) // Continue fetch
-			continueFetch = true
+	request := m.Copy()
+	request.Question[0].Name = strings.ToLower(request.Question[0].Name)
+	key := dev_cache.ScopedKey(dev_cache.CurrentScope(), request.Question[0].String())
+	if msg, due, hit := r.cache.GetWithExpire(key); hit && msg != nil {
+		if !time.Now().Before(due) {
+			logDNSCache(request.Question[0], "stale", strings.SplitN(key, keySep, 2)[0])
+			r.refreshAnswer(key, request)
 		} else {
-			logDNSCache(q, "fresh", "")
-			// updating TTL by subtracting common delta time from each DNS record
-			updateMsgTTL(msg, uint32(time.Until(expireTime).Seconds()))
+			logDNSCache(request.Question[0], "fresh", strings.SplitN(key, keySep, 2)[0])
 		}
-		return
+		return cachedReply(msg, due, m), nil
 	}
-	logDNSCache(q, "miss", "")
-	return r.exchangeWithoutCache(ctx, m)
+	logDNSCache(request.Question[0], "miss", strings.SplitN(key, keySep, 2)[0])
+	wait := r.refreshAnswer(key, request)
+	msg, err := wait(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return cachedReply(msg, time.Time{}, m), nil
 }
 
-// ExchangeWithoutCache a batch of dns request, and it do NOT GET from cache
-func (r *Resolver) exchangeWithoutCache(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
-	q := m.Question[0]
+func cachedReply(msg *D.Msg, due time.Time, request *D.Msg) *D.Msg {
+	msg = msg.Copy()
+	msg.Id = request.Id
+	msg.Question = append([]D.Question(nil), request.Question...)
+	if !due.IsZero() {
+		if !time.Now().Before(due) {
+			setMsgTTL(msg, 3)
+		} else {
+			updateMsgTTL(msg, uint32(max(1, time.Until(due)/time.Second)))
+		}
+	}
+	return msg
+}
 
-	retryNum := 0
-	retryMax := 3
-	fn := func() (result *D.Msg, err error) {
-		ctx, cancel := context.WithTimeout(context.Background(), resolver.DefaultDNSTimeout) // reset timeout in singleflight
-		defer cancel()
+func (r *Resolver) refreshAnswer(key string, m *D.Msg) func(context.Context) (*D.Msg, error) {
+	return r.cache.Refresh(key, resolver.DefaultDNSTimeout, func(ctx context.Context) (*D.Msg, time.Time, error) {
+		var msg *D.Msg
+		var err error
 		cache := false
-
-		defer func() {
-			if err != nil {
-				result = &D.Msg{}
-				result.Opcode = retryNum
-				retryNum++
-				return
-			}
-
-			if cache {
-				putMsgToCache(r.cache, q, result)
-			}
-		}()
-
-		isIPReq := isIPRequest(q)
-		if isIPReq {
+		if isIPRequest(m.Question[0]) {
+			msg, err = r.ipExchange(ctx, m)
 			cache = true
-			return r.ipExchange(ctx, m)
+		} else if matched := r.matchPolicy(m); len(matched) > 0 {
+			msg, cache, err = batchExchange(ctx, matched, m)
+		} else {
+			msg, cache, err = batchExchange(ctx, r.main, m)
 		}
-
-		if matched := r.matchPolicy(m); len(matched) != 0 {
-			result, cache, err = batchExchange(ctx, matched, m)
-			return
+		if err != nil {
+			return nil, time.Time{}, err
 		}
-		result, cache, err = batchExchange(ctx, r.main, m)
-		return
-	}
-
-	ch := r.group.DoChan(q.String(), fn)
-
-	var result singleflight.Result[*D.Msg]
-
-	select {
-	case result = <-ch:
-		break
-	case <-ctx.Done():
-		select {
-		case result = <-ch: // maybe ctxDone and chFinish in same time, get DoChan's result as much as possible
-			break
-		default:
-			go func() { // start a retrying monitor in background
-				result := <-ch
-				ret, err, shared := result.Val, result.Err, result.Shared
-				if err != nil && !shared && ret.Opcode < retryMax { // retry
-					r.group.DoChan(q.String(), fn)
-				}
-			}()
-			return nil, ctx.Err()
+		if msg == nil || msg.Truncated || (msg.Rcode != D.RcodeSuccess && msg.Rcode != D.RcodeNameError) {
+			return nil, time.Time{}, errors.New("unusable DNS refresh response")
 		}
-	}
-
-	ret, err, shared := result.Val, result.Err, result.Shared
-	if err != nil && !shared && ret.Opcode < retryMax { // retry
-		r.group.DoChan(q.String(), fn)
-	}
-
-	if err == nil {
-		msg = ret
-		if shared {
-			msg = msg.Copy()
+		if !cache {
+			return msg.Copy(), time.Time{}, nil
 		}
-	}
-
-	return
+		stored, due := prepareCachedMessage(m.Question[0], msg)
+		return stored, due, nil
+	})
 }
 
 func (r *Resolver) matchPolicy(m *D.Msg) []dnsClient {
@@ -408,8 +358,14 @@ func (r *Resolver) Invalid() bool {
 }
 
 func (r *Resolver) ClearCache() {
-	r.ClearVolatileCache()
 	if r != nil {
+		if r.cache != nil {
+			r.cache.Clear()
+		}
+		if r.domainClient != nil {
+			r.domainClient.cache.Clear()
+			r.domainClient.records.Clear()
+		}
 		for _, cache := range r.sourceCaches {
 			cache.Clear()
 		}
@@ -417,11 +373,24 @@ func (r *Resolver) ClearCache() {
 }
 
 func (r *Resolver) ClearVolatileCache() {
-	if r != nil && r.domainClient != nil {
-		r.domainClient.cache.Clear()
+	// Network handovers select another partition; they must not discard an
+	// offline network's answers. Refresh deadlines remain independently valid.
+	if r == nil {
+		return
 	}
-	if r != nil && r.cache != nil {
-		r.cache.Clear()
+	scope := dev_cache.CurrentScope()
+	mark := func(c dnsCache) {
+		if c != nil {
+			c.MarkStale(func(key string) bool { return dev_cache.InScope(key, scope) })
+		}
+	}
+	mark(r.cache)
+	for _, c := range r.sourceCaches {
+		mark(c)
+	}
+	if r.domainClient != nil {
+		mark(r.domainClient.cache)
+		mark(r.domainClient.records)
 	}
 }
 
@@ -498,6 +467,7 @@ type Policy struct {
 }
 
 type Config struct {
+	CacheIdentity        string
 	Main, Fallback       []NameServer
 	Default              []NameServer
 	ProxyServer          []NameServer
@@ -518,12 +488,7 @@ func (config Config) newCache() dnsCache {
 	if config.CacheMaxSize == 0 {
 		config.CacheMaxSize = 32768
 	}
-	switch config.CacheAlgorithm {
-	case "arc":
-		return arc.New(arc.WithSize[string, *D.Msg](config.CacheMaxSize))
-	default:
-		return lru.New(lru.WithSize[string, *D.Msg](config.CacheMaxSize), lru.WithStale[string, *D.Msg](true))
-	}
+	return dev_cache.New[string, *D.Msg](config.CacheMaxSize, config.CacheAlgorithm)
 }
 
 type Resolvers struct {
@@ -580,7 +545,7 @@ func NewResolverFromClient(client dnsClient) *Resolver {
 // A domain that routes to a local leaf never reaches that public resolver at
 // all: it has no proxy server, and its service records are the ones a direct
 // connection will use, so direct is the resolver asked for it.
-func NewFakeIPServiceResolver(defaultServers []NameServer, direct *Resolver, cacheAlgorithm string, cacheMaxSize int) *Resolver {
+func NewFakeIPServiceResolver(defaultServers []NameServer, direct *Resolver, cacheAlgorithm string, cacheMaxSize int, identity ...string) *Resolver {
 	config := fakeIPServiceConfig(defaultServers, cacheAlgorithm, cacheMaxSize)
 
 	bootstrap := &Resolver{
@@ -596,10 +561,17 @@ func NewFakeIPServiceResolver(defaultServers []NameServer, direct *Resolver, cac
 		directExchange = direct
 	}
 
+	client := newDomainClient(public[0], directExchange, cacheMaxSize)
+	namespace := "v1"
+	if len(identity) > 0 {
+		namespace += "/" + identity[0]
+	}
+	client.cache = attachDNSCache("domain-bundle/"+namespace, client.cache)
+	client.records = attachDNSCache("domain-record/"+namespace, client.records)
 	return &Resolver{
 		ipv6:            true,
 		main:            []dnsClient{public[0]},
-		domainClient:    newDomainClient(public[0], directExchange, cacheMaxSize),
+		domainClient:    client,
 		cache:           config.newCache(),
 		defaultResolver: bootstrap,
 	}
@@ -737,6 +709,20 @@ func NewResolver(config Config) (rs Resolvers) {
 		r.fallbackIPFilters = config.FallbackIPFilter
 		r.fallbackDomainFilters = config.FallbackDomainFilter
 		r.fallbackLazyQuery = config.FallbackLazyQuery
+	}
+	// Availability changes must reattach the same A/AAAA stores. Policy and
+	// upstream configuration remain part of the namespace. Complex matcher
+	// identities conservatively start a new namespace if reconstructed.
+	identityConfig := config
+	identityConfig.IPv6 = false
+	identity := fmt.Sprintf("%x", sha256.Sum256([]byte(fmt.Sprintf("%#v", identityConfig))))
+	if config.CacheIdentity != "" {
+		identity = config.CacheIdentity
+	}
+	for _, resolver := range []*Resolver{rs.Resolver, rs.ProxyResolver, rs.DirectResolver.Resolver, rs.BootstrapResolver} {
+		if resolver != nil {
+			resolver.cacheIdentity = identity
+		}
 	}
 
 	return

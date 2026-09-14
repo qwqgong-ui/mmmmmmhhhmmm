@@ -144,6 +144,19 @@ func (a *ARC[K, V]) Len() int {
 	return a.len
 }
 
+// Delete removes both a live value and its replacement-history entry.
+func (a *ARC[K, V]) Delete(key K) {
+	a.mutex.Lock()
+	defer a.mutex.Unlock()
+	if ent, ok := a.cache[key]; ok {
+		ent.detach()
+		if !ent.ghost {
+			a.len--
+		}
+		delete(a.cache, key)
+	}
+}
+
 func (a *ARC[K, V]) req(ent *entry[K, V]) {
 	switch {
 	case ent.ll == a.t1 || ent.ll == a.t2:

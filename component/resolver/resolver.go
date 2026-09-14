@@ -304,9 +304,9 @@ func ResolveECH(ctx context.Context, host string) ([]byte, error) {
 
 func ClearCache() {
 	if DefaultResolver != nil {
-		go DefaultResolver.ClearCache()
+		DefaultResolver.ClearCache()
 	}
-	go SystemResolver.ClearCache() // SystemResolver unneeded check nil
+	SystemResolver.ClearCache() // SystemResolver unneeded check nil
 }
 
 // ClearVolatileCache drops ordinary resolver answers after a network handover

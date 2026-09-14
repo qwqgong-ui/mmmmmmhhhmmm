@@ -67,13 +67,13 @@ func TestDomainBundleAddressFirstNodeIsolationAndExpiry(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "192.0.2.2", answer.Answer[0].(*D.A).A.String())
 	require.EqualValues(t, 2, calls.Load())
-	key := domainKey{"US", "example.com"}
+	key := domainKey("US", "example.com")
 	cached, ok := client.cache.Get(key)
 	require.True(t, ok)
 	client.cache.SetWithExpire(key, cached, time.Now().Add(-time.Second))
 	_, err = client.ExchangeContext(t.Context(), httpsQuery("example.com"))
 	require.NoError(t, err)
-	require.EqualValues(t, 3, calls.Load())
+	require.Eventually(t, func() bool { return calls.Load() == 3 }, time.Second, time.Millisecond)
 }
 
 func TestFakeIPFirstAddressWarmsServiceBundle(t *testing.T) {
@@ -91,7 +91,7 @@ func TestFakeIPFirstAddressWarmsServiceBundle(t *testing.T) {
 	require.NoError(t, err)
 	require.EqualValues(t, 1, calls.Load())
 	require.Contains(t, serviceRecordValues(service.Answer[0]), D.SVCB_ECHCONFIG)
-	cached, ok := client.cache.Get(domainKey{"JP", "example.com"})
+	cached, ok := client.cache.Get(domainKey("JP", "example.com"))
 	require.True(t, ok)
 	require.Equal(t, "192.0.2.1", cached.Extra[0].(*D.A).A.String())
 	require.Equal(t, "192.0.2.50", serviceRecordValues(cached.Answer[0])[D.SVCB_IPV4HINT].(*D.SVCBIPv4Hint).Hint[0].String())

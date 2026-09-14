@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/component/dev_cache"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/component/tunneldns"
 	D "github.com/miekg/dns"
@@ -113,6 +114,9 @@ type CacheDiagnostic struct {
 	ExpiresAt          time.Time `json:"expiresAt"`
 	NetworkScope       string    `json:"networkScope"`
 	ECSGenerationKnown bool      `json:"ecsGenerationKnown"`
+	Usable             bool      `json:"usable"`
+	RefreshDue         bool      `json:"refreshDue"`
+	dev_cache.RefreshStatus
 	MessageDiagnostic
 }
 
@@ -136,7 +140,7 @@ func CacheSnapshots(name string) []CacheDiagnostic {
 	persistMu.Unlock()
 	result := make([]CacheDiagnostic, 0)
 	now := time.Now()
-	add := func(resolverName, source, node, key string, msg *D.Msg, expiry time.Time) {
+	add := func(resolverName, source, node, key string, msg *D.Msg, expiry time.Time, c dnsCache) {
 		if msg == nil || len(msg.Question) != 1 {
 			return
 		}
@@ -153,17 +157,24 @@ func CacheSnapshots(name string) []CacheDiagnostic {
 		if !now.Before(expiry) {
 			state = "stale"
 		}
-		result = append(result, CacheDiagnostic{Resolver: resolverName, Source: source, Node: node, Name: host, Type: D.TypeToString[q.Qtype], State: state, TTL: max(0, int64(expiry.Sub(now)/time.Second)), ExpiresAt: expiry, NetworkScope: scope, MessageDiagnostic: InspectMessage(msg)})
+		result = append(result, CacheDiagnostic{Resolver: resolverName, Source: source, Node: node, Name: host, Type: D.TypeToString[q.Qtype], State: state, TTL: max(0, int64(expiry.Sub(now)/time.Second)), ExpiresAt: expiry, NetworkScope: scope, MessageDiagnostic: InspectMessage(msg), Usable: true, RefreshDue: state == "stale", RefreshStatus: c.Status(key)})
 	}
 	for label, c := range caches {
-		items, _ := snapshotOf(c)
+		items := c.Snapshot()
 		for _, item := range items {
-			add(label, label, "", item.Key, item.Value, item.Expires)
+			add(label, label, "", item.Key, item.Value, item.Expires, c)
 		}
 	}
 	if service != nil && service.domainClient != nil {
-		for _, item := range service.domainClient.cache.Snapshot() {
-			add("domain-bundle", "server-dns", item.Key.node, "", item.Value, item.Expires)
+		for label, c := range map[string]dnsCache{"domain-bundle": service.domainClient.cache, "domain-record": service.domainClient.records} {
+			for _, item := range c.Snapshot() {
+				parts := strings.SplitN(item.Key, keySep, 3)
+				node := ""
+				if len(parts) > 1 {
+					node = parts[1]
+				}
+				add(label, "server-dns", node, item.Key, item.Value, item.Expires, c)
+			}
 		}
 	}
 	sort.Slice(result, func(i, j int) bool {

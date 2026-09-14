@@ -72,8 +72,8 @@ func TestTCPConcurrentCacheExpirationAndRefresh(t *testing.T) {
 	}
 
 	now = now.Add(11 * time.Minute)
-	if _, loaded := cache.Get(key); loaded {
-		t.Fatal("expired entry was returned")
+	if winner, loaded := cache.Get(key); !loaded || winner != ip {
+		t.Fatal("refresh deadline erased a retained winner")
 	}
 }
 
@@ -202,7 +202,7 @@ func installTestTCPConcurrentCache(t *testing.T) *TCPConcurrentCache {
 
 func mustTCPConcurrentCacheKey(t *testing.T, host, port, network string) string {
 	t.Helper()
-	key, cacheable := tcpConcurrentCacheKey(host, port, network)
+	key, cacheable := tcpConcurrentPathKey(host, port, network, directNetworkScope(option{}), option{})
 	if !cacheable {
 		t.Fatalf("destination %s:%s/%s is not cacheable", host, port, network)
 	}
@@ -445,7 +445,7 @@ func TestTCPConcurrentCachedWinnerMustRemainCandidate(t *testing.T) {
 	}
 }
 
-func TestTCPConcurrentDoesNotCacheFailedFallback(t *testing.T) {
+func TestTCPConcurrentFailedFallbackRetainsOldWinnerWithBackoff(t *testing.T) {
 	cache := installTestTCPConcurrentCache(t)
 	ipA := netip.MustParseAddr("192.0.2.1")
 	ipB := netip.MustParseAddr("192.0.2.2")
@@ -464,8 +464,11 @@ func TestTCPConcurrentDoesNotCacheFailedFallback(t *testing.T) {
 	if result.error == nil {
 		t.Fatal("failed full race returned nil error")
 	}
-	if _, loaded := cache.Get(key); loaded {
-		t.Fatal("failed fallback left a cached winner")
+	if winner, loaded := cache.Get(key); !loaded || winner != ipB {
+		t.Fatal("failed fallback erased the retained winner")
+	}
+	if _, eligible := cache.Winners(key); eligible {
+		t.Fatal("failed winner did not enter retry backoff")
 	}
 }
 

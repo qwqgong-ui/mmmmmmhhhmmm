@@ -19,7 +19,7 @@ External controller 提供以下诊断接口；配置 `secret` 时均要求 Bear
 
 规则结果始终是 preview：请求没有真实客户端的源地址、进程、入站和嗅探信息；需额外 DNS 才能判断的 IP 规则会标记 complete=false。预览不增加规则命中/未命中计数。DNS service 的服务器节点选择仍按实际服务的 TCP/443 语义运行，不是假装能重放任意客户端连接。
 
-候选只采用适用的 fresh DIRECT scope 或选定节点的 domain bundle；无记录返回 candidatesKnown=false。原始缓存记录同时保留，方便比较旧网络，但不会自动视为当前候选。TCP winner 附自己的端口、scope 和排序；QUIC warm cache 原本不保留 RTT、端口、scope，接口明确标记未知，不能据此认定当前连接一定可用。每条 DNS 缓存原本不保存 ECS generation，因此 ecsGenerationKnown=false；顶层 ECS 是当前状态，不倒推历史值。
+候选采用当前网络分区中适用的 DIRECT 或选定节点缓存；[dev_cache](dev-cache.md) 的陈旧答案仍可使用，`refreshDue` 不等于不可用。无记录返回 candidatesKnown=false。旧网络记录不会自动视为当前候选。TCP winner 附自己的端口、scope、排序和重试退避；QUIC warm cache 原本不保留 RTT、端口、scope，接口明确标记未知，不能据此认定当前连接一定可用。每条 DNS 缓存不保存 ECS generation，因此 ecsGenerationKnown=false；顶层 ECS 是当前状态，不倒推历史值。
 
 ECH 仅表示是否携带配置，不输出密钥材料，也不证明握手成功。AD/RRSIG 是观测值，不是诊断接口做了独立 DNSSEC 验证。
 

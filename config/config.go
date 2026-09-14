@@ -1,6 +1,7 @@
 package config
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"net"
@@ -147,6 +148,7 @@ type NTP struct {
 
 // DNS config
 type DNS struct {
+	CacheIdentity         string
 	Enable                bool
 	PreferH3              bool
 	IPv6                  bool
@@ -1420,6 +1422,24 @@ func parseNameServerPolicy(nsPolicy *orderedmap.OrderedMap[string, any], adapter
 	return policy, nil
 }
 
+// Hash configuration data, not compiled matcher pointers: addresses of geosite
+// and rule-set matchers change across restart even when the configuration does not.
+func dnsCacheIdentity(rawCfg *RawConfig) (string, error) {
+	dns := rawCfg.DNS
+	dns.IPv6 = false
+	input := struct {
+		DNS            RawDNS
+		Proxies        any
+		ProxyProviders any
+		RuleProviders  any
+	}{dns, rawCfg.Proxy, rawCfg.ProxyProvider, rawCfg.RuleProvider}
+	data, err := yaml.Marshal(input)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("%x", sha256.Sum256(data)), nil
+}
+
 func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS, error) {
 	cfg := rawCfg.DNS
 	if cfg.Enable && len(cfg.NameServer) == 0 {
@@ -1444,6 +1464,9 @@ func parseDNS(rawCfg *RawConfig, ruleProviders map[string]P.RuleProvider) (*DNS,
 		CacheMaxSize:      cfg.CacheMaxSize,
 	}
 	var err error
+	if dnsCfg.CacheIdentity, err = dnsCacheIdentity(rawCfg); err != nil {
+		return nil, fmt.Errorf("encode DNS cache identity: %w", err)
+	}
 	if dnsCfg.NameServer, err = parseNameServer(cfg.NameServer, cfg.RespectRules, cfg.PreferH3); err != nil {
 		return nil, err
 	}

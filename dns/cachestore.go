@@ -1,298 +1,129 @@
 package dns
 
 import (
+	"encoding/json"
 	"fmt"
-	"maps"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/metacubex/mihomo/common/arc"
-	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/component/dev_cache"
 	"github.com/metacubex/mihomo/component/profile/cachefile"
 	"github.com/metacubex/mihomo/log"
-
 	D "github.com/miekg/dns"
 )
 
-// StoreInterval is how often the DNS answer cache is written to the cache file
-// on top of the flush that runs at shutdown.
 const StoreInterval = time.Hour
-
-// arcSnapshot and lruSnapshot are the snapshot APIs of the two cache
-// implementations behind cache-algorithm. They return different item types, so
-// snapshotOf normalises them; a cache providing neither is simply not
-// persisted.
-type arcSnapshot interface {
-	Snapshot() []arc.Item[string, *D.Msg]
-}
-
-type lruSnapshot interface {
-	Snapshot() []lru.Item[string, *D.Msg]
-}
-
-// cacheItem is one entry from either implementation.
-type cacheItem struct {
-	Key     string
-	Value   *D.Msg
-	Expires time.Time
-}
-
-// snapshotOf returns c's entries, or ok=false when c cannot be snapshotted.
-func snapshotOf(c dnsCache) (items []cacheItem, ok bool) {
-	switch sc := c.(type) {
-	case arcSnapshot:
-		for _, item := range sc.Snapshot() {
-			items = append(items, cacheItem{Key: item.Key, Value: item.Value, Expires: item.Expires})
-		}
-	case lruSnapshot:
-		for _, item := range sc.Snapshot() {
-			items = append(items, cacheItem{Key: item.Key, Value: item.Value, Expires: item.Expires})
-		}
-	default:
-		return nil, false
-	}
-	return items, true
-}
-
-// keySep separates a resolver's name from the DNS question inside a persisted
-// key. mihomo runs several resolvers (main, proxy-server, direct) with
-// independent caches; they share one bucket, so their keys must not collide.
-const keySep = "\x00"
+const keySep = dev_cache.Separator
 
 var (
 	persistMu     sync.Mutex
 	persistCaches = make(map[string]dnsCache)
 	storeOnce     sync.Once
-
-	// restored guards the one-time replay of the previous run's answers.
-	// updateDNS runs again on every config reload *and* on every runtime
-	// IPv6 availability flip, each time building fresh caches; replaying
-	// the on-disk snapshot into them would resurrect answers the user just
-	// reconfigured away, and would carry one network's unscoped answers
-	// (main/proxy-server/direct) across a network switch.
-	restored bool
+	storeMu       sync.Mutex
 )
 
-// registerPersistentCache remembers the live cache so StoreCache can snapshot
-// it later, and restores whatever the previous run left behind.
-//
-// It must not touch the cache file: resolvers are built before the runtime has
-// finished pointing C.Path at the -d directory, and cachefile.Cache() is a
-// singleton that permanently latches whatever path it first sees. Calling it
-// here made the whole process open (and fail on) the default
-// $HOME/.config/mihomo/cache.db, which left the fake-ip pool with no store at
-// all. LoadPersistentCache does the file work, once the runtime is ready.
 func registerPersistentCache(name string, c dnsCache) {
-	if _, ok := snapshotOf(c); !ok {
-		return
-	}
-
 	persistMu.Lock()
+	defer persistMu.Unlock()
 	persistCaches[name] = c
-	persistMu.Unlock()
 }
 
-// RegisterPersistentCaches makes one generation of resolvers the set that is
-// snapshotted to the cache file, replacing whatever the previous generation
-// registered.
-//
-// Only the runtime's own resolvers belong here. NewResolver is also used to
-// build the private resolvers of individual outbounds (wireguard, masque,
-// openvpn, zerotier); registering from inside the constructor filed those
-// under the same names as the global ones, so an outbound's private answers
-// were persisted in place of the real main resolver's and restored into it on
-// the next start.
-//
-// The registry is replaced wholesale rather than added to: updateDNS runs
-// again on every reload and on every runtime IPv6 availability flip, and a
-// resolver the new configuration no longer builds would otherwise keep its
-// cache -- and the resolver graph behind it -- alive and on disk forever.
+func attachDNSCache(name string, c dnsCache) dnsCache {
+	return dev_cache.Attach(name, c, func(msg *D.Msg) ([]byte, error) { return msg.Pack() }, func(data []byte) (*D.Msg, error) {
+		msg := new(D.Msg)
+		err := msg.Unpack(data)
+		return msg, err
+	})
+}
+
+// Runtime resolvers reattach to their configuration namespace. Private outbound
+// resolvers remain private and cannot replace the global DNS persistence owner.
 func RegisterPersistentCaches(rs Resolvers) {
 	persistMu.Lock()
 	clear(persistCaches)
 	persistMu.Unlock()
-
-	if rs.Resolver != nil {
-		registerPersistentCache("main", rs.Resolver.cache)
+	attach := func(role string, r *Resolver) {
+		if r == nil || r.cache == nil {
+			return
+		}
+		r.cache = attachDNSCache("dns/"+r.cacheIdentity+"/"+role, r.cache)
+		registerPersistentCache(role, r.cache)
 	}
-	if rs.ProxyResolver != nil {
-		registerPersistentCache("proxy-server", rs.ProxyResolver.cache)
-	}
-	direct := rs.DirectResolver
-	if direct == nil || direct.Resolver == nil {
+	attach("main", rs.Resolver)
+	attach("proxy-server", rs.ProxyResolver)
+	attach("bootstrap", rs.BootstrapResolver)
+	if rs.DirectResolver == nil || rs.DirectResolver.Resolver == nil {
 		return
 	}
-	registerPersistentCache("direct", direct.cache)
-	for index, sourceCache := range direct.sourceCaches {
-		if index >= len(direct.main) {
-			break
-		}
-		// Keyed by the upstream's own address, never by its position alone:
-		// reordering direct-nameserver must not hand one upstream the answers
-		// persisted for another.
-		registerPersistentCache(fmt.Sprintf("direct-source-%d-%s", index+1, direct.main[index].Address()), sourceCache)
+	direct := rs.DirectResolver.Resolver
+	attach("direct", direct)
+	for index, c := range direct.sourceCaches {
+		name := fmt.Sprintf("direct-source-%d-%s", index+1, direct.main[index].Address())
+		direct.sourceCaches[index] = attachDNSCache("dns/"+direct.cacheIdentity+"/"+name, c)
+		registerPersistentCache(name, direct.sourceCaches[index])
 	}
 }
 
-// LoadPersistentCache restores previously persisted answers into every
-// registered cache and starts the periodic snapshot. Call it from the runtime
-// after the DNS resolvers are in place, never during their construction.
+// Load only after C.Path is initialized. Legacy unscoped dnscache records are
+// deliberately not imported: their original physical network is unknowable.
 func LoadPersistentCache() {
-	persistMu.Lock()
-	caches := make(map[string]dnsCache, len(persistCaches))
-	maps.Copy(caches, persistCaches)
-	persistMu.Unlock()
-
-	if len(caches) == 0 {
+	var records []dev_cache.Record
+	data, err := cachefile.Cache().DevCache()
+	if err == nil && len(data) > 0 {
+		err = json.Unmarshal(data, &records)
+	}
+	if err != nil {
+		log.Fields(log.WARNING, map[string]string{"subsystem": "dev_cache", "event": "persistent_cache_load_failed"}, "Cache restore failed: %v", err)
 		return
 	}
-
-	persistMu.Lock()
-	replay := !restored
-	restored = true
-	persistMu.Unlock()
-	if replay {
-		entries, err := cachefile.Cache().ReadDNSCache()
-		if err != nil {
-			log.Fields(log.WARNING, map[string]string{"subsystem": "dns", "event": "persistent_cache_load_failed", "reason": err.Error()}, "[DNS] persistent cache load failed: %v", err)
-		} else {
-			for name, c := range caches {
-				loadCache(name, c, entries)
+	if dev_cache.Restore(records) {
+		log.Fields(log.INFO, map[string]string{"subsystem": "dev_cache", "event": "persistent_cache_restored", "entries": fmt.Sprint(len(records))}, "Restored retained cache snapshot")
+	}
+	storeOnce.Do(func() {
+		go func() {
+			ticker := time.NewTicker(StoreInterval)
+			defer ticker.Stop()
+			for range ticker.C {
+				StoreCache()
 			}
-		}
-	}
-	storeOnce.Do(startStoreLoop)
+		}()
+	})
 }
 
-// loadCache restores persisted answers. Entries keep their original expiry, so
-// an answer that went stale while mihomo was down is restored stale: the
-// optimistic-cache path serves it once and refreshes it in the background,
-// exactly as it would have without a restart.
-func loadCache(name string, c dnsCache, entries []cachefile.DNSEntry) {
-	prefix := name + keySep
-	restored := 0
-	stale := 0
-	invalid := 0
-	now := time.Now()
-	for _, entry := range entries {
-		key, ok := strings.CutPrefix(entry.Key, prefix)
-		if !ok {
-			continue
-		}
-		msg := new(D.Msg)
-		if err := msg.Unpack(entry.Msg); err != nil {
-			invalid++
-			continue
-		}
-		c.SetWithExpire(key, msg, entry.Expires)
-		restored++
-		if !now.Before(entry.Expires) {
-			stale++
-		}
-	}
-	log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "persistent_cache_loaded", "resolver": name, "restored": fmt.Sprint(restored), "stale": fmt.Sprint(stale), "invalid": fmt.Sprint(invalid)}, "[DNS] persistent cache loaded for %s: restored=%d stale=%d invalid=%d", name, restored, stale, invalid)
-}
-
-// StoreCache writes the current DNS answer cache to the cache file. It is safe
-// to call when the cache is absent or cannot be snapshotted.
 func StoreCache() {
-	persistMu.Lock()
-	caches := make(map[string]dnsCache, len(persistCaches))
-	maps.Copy(caches, persistCaches)
-	persistMu.Unlock()
-
-	var entries []cachefile.DNSEntry
-	for name, c := range caches {
-		items, ok := snapshotOf(c)
-		if !ok {
-			continue
-		}
-		for _, item := range items {
-			if item.Value == nil {
-				continue
-			}
-			packed, err := item.Value.Pack()
-			if err != nil {
-				continue
-			}
-			entries = append(entries, cachefile.DNSEntry{
-				Key:     name + keySep + item.Key,
-				Msg:     packed,
-				Expires: item.Expires,
-			})
-		}
+	storeMu.Lock()
+	defer storeMu.Unlock()
+	records := dev_cache.Snapshot()
+	data, err := json.Marshal(records)
+	if err == nil {
+		err = cachefile.Cache().SetDevCache(data)
 	}
-
-	if err := cachefile.Cache().SetDNSCache(entries); err != nil {
-		log.Fields(log.WARNING, map[string]string{"subsystem": "dns", "event": "persistent_cache_flush_failed", "reason": err.Error()}, "[DNS] persistent cache flush failed: %v", err)
+	if err != nil {
+		log.Fields(log.WARNING, map[string]string{"subsystem": "dev_cache", "event": "persistent_cache_flush_failed"}, "Cache flush failed: %v", err)
 		return
 	}
-	log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "persistent_cache_flushed", "entries": fmt.Sprint(len(entries))}, "[DNS] flushed %d cached answers to cache file", len(entries))
+	log.Fields(log.INFO, map[string]string{"subsystem": "dev_cache", "event": "persistent_cache_flushed", "entries": fmt.Sprint(len(records))}, "Stored retained cache snapshot")
 }
 
-func startStoreLoop() {
-	go func() {
-		ticker := time.NewTicker(StoreInterval)
-		defer ticker.Stop()
-		for range ticker.C {
-			StoreCache()
-		}
-	}()
+// FlushDevCache is synchronous, including the on-disk snapshot. In-flight
+// refreshes carry an invalidated generation and cannot undo a manual flush.
+func FlushDevCache() {
+	dev_cache.ClearAll()
+	StoreCache()
 }
 
-// cacheDeleter is implemented by the cache algorithms that can remove a single
-// key. A cache without it is expired in place instead, which every read path
-// already honours.
-type cacheDeleter interface {
-	Delete(key string)
-}
-
-// EvictNetworkScope drops every cached answer belonging to one network scope and
-// reports how many were removed.
-//
-// The direct-nameserver candidate caches are keyed by network scope precisely so
-// that one physical network's answers are never served on another, and that is
-// why nothing clears them on a handover. The gap is retirement: when the
-// platform stops tracking a network entirely, its branch has no owner left, yet
-// the answers survive until each entry's own expiry -- with a 24-hour floor,
-// long after the profile that explained them is gone. The platform knows when it
-// retired a network; this lets it say so.
 func EvictNetworkScope(scope string) int {
 	scope = strings.TrimSpace(scope)
 	if scope == "" {
 		return 0
 	}
-	prefix := scope + keySep
-
+	n := dev_cache.EvictScope(scope)
+	// Include unregistered/test caches and private references in this generation.
 	persistMu.Lock()
-	caches := make([]dnsCache, 0, len(persistCaches))
+	defer persistMu.Unlock()
 	for _, c := range persistCaches {
-		caches = append(caches, c)
+		n += c.DeleteMatching(func(k string) bool { return dev_cache.InScope(k, scope) })
 	}
-	persistMu.Unlock()
-
-	evicted := 0
-	for _, c := range caches {
-		items, ok := snapshotOf(c)
-		if !ok {
-			continue
-		}
-		deleter, deletable := c.(cacheDeleter)
-		for _, item := range items {
-			if !strings.HasPrefix(item.Key, prefix) {
-				continue
-			}
-			evicted++
-			if deletable {
-				deleter.Delete(item.Key)
-				continue
-			}
-			c.SetWithExpire(item.Key, item.Value, time.Unix(0, 0))
-		}
-	}
-	if evicted > 0 {
-		log.Fields(log.INFO, map[string]string{"subsystem": "dns", "event": "network_scope_evicted", "network_scope": scope, "entries": fmt.Sprint(evicted), "reason": "scope_retired"}, "[DNS] evicted %d cached answers for retired network scope %s", evicted, scope)
-	}
-	return evicted
+	return n
 }

@@ -19,11 +19,16 @@ const (
 	ICMPWriteError
 	ProcessFound
 	ProcessFallback
+	CacheRefreshStarted
+	CacheRefreshShared
+	CacheRefreshSucceeded
+	CacheRefreshFailed
+	CacheRefreshInvalidated
 	count
 )
 
 var values [count]atomic.Uint64
-var names = [...]string{"dns.cache.fresh", "dns.cache.stale", "dns.cache.miss", "dns.upstream.error", "dns.udp_tcp_retry", "direct.tcp.winner_hit", "direct.tcp.winner_miss", "direct.tcp.winner_evicted", "tun.icmp.reported", "tun.icmp.write_error", "process.found", "process.fallback"}
+var names = [...]string{"dns.cache.fresh", "dns.cache.stale", "dns.cache.miss", "dns.upstream.error", "dns.udp_tcp_retry", "direct.tcp.winner_hit", "direct.tcp.winner_miss", "direct.tcp.winner_evicted", "tun.icmp.reported", "tun.icmp.write_error", "process.found", "process.fallback", "dev_cache.refresh.started", "dev_cache.refresh.shared", "dev_cache.refresh.succeeded", "dev_cache.refresh.failed", "dev_cache.refresh.invalidated"}
 
 func Add(c Counter) { values[c].Add(1) }
 func Snapshot() map[string]uint64 {

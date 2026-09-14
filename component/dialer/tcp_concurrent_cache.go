@@ -3,6 +3,8 @@ package dialer
 import (
 	"cmp"
 	"context"
+	"encoding/json"
+	"fmt"
 	"net"
 	"net/netip"
 	"slices"
@@ -10,6 +12,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/lru"
+	"github.com/metacubex/mihomo/component/dev_cache"
 	"github.com/metacubex/mihomo/component/diagstats"
 	"github.com/metacubex/mihomo/log"
 )
@@ -47,8 +50,9 @@ const (
 // the latency measured for it. A non-positive RTT means no usable sample was
 // captured, not that the connect was instant.
 type tcpConcurrentWinner struct {
-	IP  netip.Addr
-	RTT time.Duration
+	IP         netip.Addr
+	RTT        time.Duration
+	RetryAfter time.Time
 }
 
 type tcpConcurrentCacheEntry struct {
@@ -111,7 +115,7 @@ func fastPathTimeoutFor(rtt time.Duration) time.Duration {
 // destination. It is deliberately independent from the DNS cache: callers
 // still have to validate a cached winner against the current DNS candidates.
 type TCPConcurrentCache struct {
-	entries *lru.LruCache[string, tcpConcurrentCacheEntry]
+	entries *dev_cache.Cache[string, tcpConcurrentCacheEntry]
 	ttl     time.Duration
 	now     func() time.Time
 }
@@ -126,6 +130,9 @@ type TCPWinnerSnapshot struct {
 	Rank         int       `json:"rank"`
 	RTTKnown     bool      `json:"rttKnown"`
 	ExpiresAt    time.Time `json:"expiresAt"`
+	Usable       bool      `json:"usable"`
+	RefreshDue   bool      `json:"refreshDue"`
+	RetryAfter   time.Time `json:"retryAfter,omitempty"`
 }
 
 // NewTCPConcurrentCache creates a bounded winner cache. Non-positive values
@@ -138,7 +145,7 @@ func NewTCPConcurrentCache(maxSize int, ttl time.Duration) *TCPConcurrentCache {
 		ttl = defaultTCPConcurrentCacheTTL
 	}
 	return &TCPConcurrentCache{
-		entries: lru.New(lru.WithSize[string, tcpConcurrentCacheEntry](maxSize)),
+		entries: dev_cache.New[string, tcpConcurrentCacheEntry](maxSize, "lru"),
 		ttl:     ttl,
 		now:     time.Now,
 	}
@@ -148,9 +155,8 @@ func (c *TCPConcurrentCache) getEntry(key string) (tcpConcurrentCacheEntry, bool
 	if c == nil || key == "" {
 		return tcpConcurrentCacheEntry{}, false
 	}
-	now := c.now()
 	entry, loaded := c.entries.Compute(key, func(entry tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
-		if !loaded || !now.Before(entry.expireAt) {
+		if !loaded {
 			return tcpConcurrentCacheEntry{}, true
 		}
 		return entry, false
@@ -161,17 +167,41 @@ func (c *TCPConcurrentCache) getEntry(key string) (tcpConcurrentCacheEntry, bool
 	return entry, true
 }
 
-// Winners returns the unexpired cached winners for a destination, fastest
-// first. The slice is a copy and callers may retain it.
+// Winners returns retained hints eligible for a fast-path attempt, fastest
+// first. Failure backoff temporarily skips hints without erasing them.
 func (c *TCPConcurrentCache) Winners(key string) ([]tcpConcurrentWinner, bool) {
 	entry, loaded := c.getEntry(key)
 	if !loaded || len(entry.winners) == 0 {
 		return nil, false
 	}
-	return slices.Clone(entry.winners), true
+	winners := slices.DeleteFunc(slices.Clone(entry.winners), func(w tcpConcurrentWinner) bool { return c.now().Before(w.RetryAfter) })
+	return winners, len(winners) > 0
 }
 
-// Get returns the fastest unexpired cached winner.
+// Backoff retains an unreachable winner but temporarily stops preferring it.
+// DNS refresh failure and TCP timeout must not erase the last known address.
+func (c *TCPConcurrentCache) Backoff(key string, ip netip.Addr) {
+	if c == nil {
+		return
+	}
+	c.entries.Compute(key, func(entry tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
+		if !loaded {
+			return entry, true
+		}
+		entry.winners = slices.Clone(entry.winners)
+		for i := range entry.winners {
+			if entry.winners[i].IP == ip.Unmap() {
+				entry.winners[i].RetryAfter = c.now().Add(dev_cache.RetryDelay)
+			}
+		}
+		return entry, false
+	})
+	if log.Enabled(log.DEBUG) {
+		log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "winner_backoff", "host": tcpWinnerHost(key), "retained": "true"}, "TCP winner retained after failed attempt: %s", ip)
+	}
+}
+
+// Get returns the fastest retained cached winner.
 func (c *TCPConcurrentCache) Get(key string) (netip.Addr, bool) {
 	entry, loaded := c.getEntry(key)
 	if !loaded || len(entry.winners) == 0 {
@@ -190,7 +220,7 @@ func (c *TCPConcurrentCache) RTT(key string) (time.Duration, bool) {
 	return entry.winners[0].RTT, true
 }
 
-// Set records a successful TCP winner and starts a fresh lifetime, without a
+// Set records a successful TCP winner and refresh deadline, without a
 // latency sample (the fast-path timeout for it falls back to the default
 // until a sample is recorded via SetWithRTT).
 func (c *TCPConcurrentCache) Set(key string, winner netip.Addr) {
@@ -210,19 +240,19 @@ func (c *TCPConcurrentCache) SetWithRTT(key string, winner netip.Addr, rtt time.
 		rtt = 0
 	}
 	now := c.now()
-	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
+	c.entries.ComputeWithExpire(key, func(current tcpConcurrentCacheEntry, _ time.Time, loaded bool) (tcpConcurrentCacheEntry, time.Time, bool) {
 		winners := current.winners
-		if !loaded || !now.Before(current.expireAt) {
+		if !loaded {
 			winners = nil
 		}
 		return tcpConcurrentCacheEntry{
 			winners:  insertWinner(winners, tcpConcurrentWinner{IP: winner, RTT: rtt}),
 			expireAt: now.Add(c.ttl),
-		}, false
+		}, now.Add(c.ttl), false
 	})
 }
 
-// SetIfFaster records winner only when it earns a place among the still-live
+// SetIfFaster records winner only when it earns a place among the retained cached
 // samples already stored for the scoped destination -- either a free slot or
 // a latency better than one of the winners held.
 func (c *TCPConcurrentCache) SetIfFaster(key string, winner netip.Addr, rtt time.Duration) bool {
@@ -231,17 +261,17 @@ func (c *TCPConcurrentCache) SetIfFaster(key string, winner netip.Addr, rtt time
 	}
 	now := c.now()
 	updated := false
-	c.entries.Compute(key, func(current tcpConcurrentCacheEntry, loaded bool) (tcpConcurrentCacheEntry, bool) {
+	c.entries.ComputeWithExpire(key, func(current tcpConcurrentCacheEntry, due time.Time, loaded bool) (tcpConcurrentCacheEntry, time.Time, bool) {
 		winners := current.winners
-		if !loaded || !now.Before(current.expireAt) {
+		if !loaded {
 			winners = nil
 		}
 		merged := insertWinner(winners, tcpConcurrentWinner{IP: winner, RTT: rtt})
-		if loaded && now.Before(current.expireAt) && sameWinners(merged, winners) {
-			return current, false
+		if loaded && sameWinners(merged, winners) {
+			return current, due, false
 		}
 		updated = true
-		return tcpConcurrentCacheEntry{winners: merged, expireAt: now.Add(c.ttl)}, false
+		return tcpConcurrentCacheEntry{winners: merged, expireAt: now.Add(c.ttl)}, now.Add(c.ttl), false
 	})
 	return updated
 }
@@ -299,13 +329,26 @@ func shouldLogTCPWinnerChange(key, event string) bool {
 }
 
 func tcpWinnerHost(key string) string {
-	base, _, _ := strings.Cut(key, "\x00")
+	base, _ := splitTCPWinnerKey(key)
 	address, _, _ := strings.Cut(base, "/")
 	host, _, err := net.SplitHostPort(address)
 	if err != nil {
 		return address
 	}
 	return host
+}
+
+func splitTCPWinnerKey(key string) (base, scope string) {
+	first, rest, ok := strings.Cut(key, "\x00")
+	address, _, _ := strings.Cut(first, "/")
+	if _, _, err := net.SplitHostPort(address); err == nil {
+		return first, rest
+	}
+	if !ok {
+		return first, ""
+	}
+	base, _, _ = strings.Cut(rest, "\x00")
+	return base, first
 }
 
 // Delete removes a destination from the cache.
@@ -324,8 +367,22 @@ func (c *TCPConcurrentCache) Clear() {
 	c.entries.Clear()
 }
 
-var tcpConcurrentCache = NewTCPConcurrentCache(0, 0)
+var tcpConcurrentCache = persistentTCPConcurrentCache()
 var tcpWinnerLogTimes = lru.New(lru.WithSize[string, time.Time](defaultTCPConcurrentCacheSize))
+
+func persistentTCPConcurrentCache() *TCPConcurrentCache {
+	c := NewTCPConcurrentCache(0, 0)
+	type stored struct {
+		Winners   []tcpConcurrentWinner
+		RefreshAt time.Time
+	}
+	c.entries = dev_cache.Attach("tcp-winner/v1", c.entries, func(v tcpConcurrentCacheEntry) ([]byte, error) { return json.Marshal(stored{v.winners, v.expireAt}) }, func(data []byte) (tcpConcurrentCacheEntry, error) {
+		var v stored
+		err := json.Unmarshal(data, &v)
+		return tcpConcurrentCacheEntry{v.Winners, v.RefreshAt}, err
+	})
+	return c
+}
 
 // ClearTCPConcurrentCache clears the winner cache without changing DNS cache
 // entries or DNS semantics.
@@ -345,17 +402,14 @@ func (c *TCPConcurrentCache) Snapshots(host string) []TCPWinnerSnapshot {
 	now := c.now()
 	result := make([]TCPWinnerSnapshot, 0)
 	for _, item := range c.entries.Snapshot() {
-		if !now.Before(item.Value.expireAt) {
-			continue
-		}
-		base, scope, _ := strings.Cut(item.Key, "\x00")
+		base, scope := splitTCPWinnerKey(item.Key)
 		address, network, ok := strings.Cut(base, "/")
 		cachedHost, port, err := net.SplitHostPort(address)
 		if !ok || err != nil || (host != "" && cachedHost != host) {
 			continue
 		}
 		for rank, winner := range item.Value.winners {
-			result = append(result, TCPWinnerSnapshot{Host: cachedHost, Port: port, Network: network, NetworkScope: scope, IP: winner.IP.String(), RTTMillis: winner.RTT.Milliseconds(), RTTKnown: winner.RTT > 0, Rank: rank + 1, ExpiresAt: item.Value.expireAt})
+			result = append(result, TCPWinnerSnapshot{Host: cachedHost, Port: port, Network: network, NetworkScope: scope, IP: winner.IP.String(), RTTMillis: winner.RTT.Milliseconds(), RTTKnown: winner.RTT > 0, Rank: rank + 1, ExpiresAt: item.Value.expireAt, Usable: true, RefreshDue: !now.Before(item.Value.expireAt), RetryAfter: winner.RetryAfter})
 		}
 	}
 	slices.SortFunc(result, func(a, b TCPWinnerSnapshot) int {
@@ -395,9 +449,21 @@ func tcpConcurrentCacheScopedKey(host, port, network, scope string) (string, boo
 	}
 	key := net.JoinHostPort(host, port) + "/" + network
 	if scope != "" {
-		key += "\x00" + scope
+		key = dev_cache.ScopedKey(scope, key)
 	}
 	return key, true
+}
+
+func tcpConcurrentPathKey(host, port, network, scope string, opt option) (string, bool) {
+	key, ok := tcpConcurrentCacheScopedKey(host, port, network, scope)
+	mark := opt.routingMark
+	if mark == 0 {
+		mark = int(DefaultRoutingMark.Load())
+	}
+	if opt.directAdapter != "" || mark != 0 {
+		key += fmt.Sprintf("\x00path=%s/mark=%d", opt.directAdapter, mark)
+	}
+	return key, ok
 }
 
 func containsTCPConcurrentCandidate(candidates []netip.Addr, winner netip.Addr) bool {
@@ -413,7 +479,7 @@ func containsTCPConcurrentCandidate(candidates []netip.Addr, winner netip.Addr) 
 func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []netip.Addr, port string, opt option, fallback dialFunc) dialResult {
 	// Cached and single-candidate paths still require a real TCP handshake.
 	opt.tfo = false
-	key, cacheable := tcpConcurrentCacheKey(host, port, network)
+	key, cacheable := tcpConcurrentPathKey(host, port, network, directNetworkScope(opt), opt)
 	if !cacheable {
 		return fallback(ctx, network, ips, port, opt)
 	}
@@ -432,7 +498,7 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 			return !containsTCPConcurrentCandidate(ips, winner.IP)
 		})
 		if len(winners) == 0 {
-			tcpConcurrentCache.Delete(key)
+			// Keep retained hints for other families and pending DNS sources.
 		}
 	}
 	if len(winners) > 0 {
@@ -485,12 +551,12 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 					cancelFast()
 					return dialResult{error: ctx.Err()}
 				}
-				tcpConcurrentCache.Remove(key, result.ip)
+				tcpConcurrentCache.Backoff(key, result.ip)
 			case <-fastTimer.C:
 				// Nothing the cache offered answered in time, so none of them
 				// deserves to be tried first again.
 				for _, winner := range winners {
-					tcpConcurrentCache.Remove(key, winner.IP)
+					tcpConcurrentCache.Backoff(key, winner.IP)
 				}
 				break fastRace
 			case <-ctx.Done():

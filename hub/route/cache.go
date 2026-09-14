@@ -3,6 +3,7 @@ package route
 import (
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
+	"github.com/metacubex/mihomo/dns"
 
 	"github.com/metacubex/chi"
 	"github.com/metacubex/chi/render"
@@ -32,5 +33,6 @@ func flushDnsCache(w http.ResponseWriter, r *http.Request) {
 	// to its own TTL, still pointing at an address the fresh DNS answer no
 	// longer serves.
 	dialer.ClearTCPConcurrentCache()
+	dns.FlushDevCache()
 	render.NoContent(w, r)
 }
