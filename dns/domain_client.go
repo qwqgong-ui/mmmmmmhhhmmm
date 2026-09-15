@@ -51,24 +51,37 @@ func newDomainClient(public dnsClient, direct directExchanger, size int) *domain
 }
 
 func (c *domainClient) ExchangeContext(ctx context.Context, request *D.Msg) (*D.Msg, error) {
+	msg, _, err := c.exchangeRouted(ctx, request, false)
+	return msg, err
+}
+
+// exchangeRouted reports whether a non-address query belongs to DIRECT, even
+// when its resolver fails. directOnly leaves all other routes to the caller.
+func (c *domainClient) exchangeRouted(ctx context.Context, request *D.Msg, directOnly bool) (*D.Msg, bool, error) {
 	if len(request.Question) != 1 || request.Question[0].Qclass != D.ClassINET {
-		return nil, errors.New("domain query needs one IN question")
+		return nil, false, errors.New("domain query needs one IN question")
 	}
 	q := request.Question[0]
 	addressQuery := q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA
 	host := strings.ToLower(strings.TrimSuffix(q.Name, "."))
 	node, dial, err := c.prepare(host)
+	if !addressQuery && errors.Is(err, tunnel.ErrTunnelDNSDirectNode) {
+		msg, err := c.directExchange(ctx, request)
+		return msg, true, err
+	}
+	if directOnly {
+		return nil, false, nil
+	}
+	msg, err := c.exchangePrepared(ctx, request, node, host, dial, err)
+	return msg, false, err
+}
+
+func (c *domainClient) exchangePrepared(ctx context.Context, request *D.Msg, node, host string, dial func(context.Context) (net.Conn, error), err error) (*D.Msg, error) {
+	q := request.Question[0]
+	addressQuery := q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA
 	if err != nil {
 		if addressQuery {
 			return nil, err
-		}
-		// A domain whose own traffic never leaves this machine has no proxy
-		// server to ask, and its service records are the ones a direct
-		// connection will be built on. Asking a public resolver through a
-		// proxy would answer with a different network's view of the domain,
-		// and would send every direct domain's name out through that proxy.
-		if errors.Is(err, tunnel.ErrTunnelDNSDirectNode) {
-			return c.directExchange(ctx, request)
 		}
 		// A leaf with no server that is not direct either -- reject above all
 		// -- is one nothing ever connects through. Whatever its service
@@ -265,9 +278,8 @@ func (c *domainClient) publicExchange(ctx context.Context, request *D.Msg) (*D.M
 	return c.public.ExchangeContext(ctx, withoutBundleOption(request))
 }
 
-// directExchange answers from `direct-nameserver`. Without one configured
-// there is nothing better to ask here: the ordinary resolution path the caller
-// falls back to is local too, and it already knows this domain's policy.
+// directExchange answers only from `direct-nameserver`. Missing or failed
+// direct resolvers must not send a DIRECT record query to another resolver.
 func (c *domainClient) directExchange(ctx context.Context, request *D.Msg) (*D.Msg, error) {
 	if c.direct == nil {
 		return nil, ErrNoDirectNameServer

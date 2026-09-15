@@ -146,11 +146,15 @@ type directOnlyClient struct {
 	calls    []uint16
 	request  *D.Msg
 	response *D.Msg
+	err      error
 }
 
 func (c *directOnlyClient) ExchangeContext(_ context.Context, request *D.Msg) (*D.Msg, error) {
 	c.calls = append(c.calls, request.Question[0].Qtype)
 	c.request = request.Copy()
+	if c.err != nil {
+		return nil, c.err
+	}
 	response := c.response.Copy()
 	response.SetReply(request)
 	response.Answer = c.response.Answer
@@ -202,14 +206,14 @@ func TestLocalDomainServiceQueryDropsBundleOption(t *testing.T) {
 	require.Empty(t, direct.request.IsEdns0().Option, "the direct nameserver must not receive the tunnel-only option")
 }
 
-func TestLocalDomainWithoutDirectNameServerFallsThrough(t *testing.T) {
+func TestLocalDomainWithoutDirectNameServerDoesNotFallThrough(t *testing.T) {
 	client, public := localNodeClient(t, nil)
 	_, err := client.ExchangeContext(t.Context(), httpsQuery("example.cn"))
 	require.ErrorIs(t, err, ErrNoDirectNameServer)
 	require.Empty(t, public.calls)
 
-	// withFakeIP turns that into the ordinary resolution path, which is local
-	// too, rather than into a public query carried by a proxy.
+	// Missing direct-nameserver must not silently switch a DIRECT query to
+	// the ordinary nameserver path.
 	fallbacks := 0
 	pool := newTestFakeIPPool(t, "198.18.0.0/16")
 	handler := withFakeIP(&fakeip.Skipper{}, pool, nil, 60, &Resolver{domainClient: client})(func(_ *icontext.DNSContext, r *D.Msg) (*D.Msg, error) {
@@ -220,9 +224,9 @@ func TestLocalDomainWithoutDirectNameServerFallsThrough(t *testing.T) {
 		return response, nil
 	})
 	answer, err := handler(icontext.NewDNSContext(t.Context()), httpsQuery("example.cn"))
-	require.NoError(t, err)
-	require.Equal(t, 1, fallbacks)
-	require.NotEmpty(t, answer.Answer)
+	require.ErrorIs(t, err, ErrNoDirectNameServer)
+	require.Zero(t, fallbacks)
+	require.Nil(t, answer)
 	require.Empty(t, public.calls)
 }
 

@@ -152,7 +152,25 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 			q := r.Question[0]
 
 			host := strings.TrimRight(q.Name, ".")
-			if skipper.ShouldSkipped(host) {
+			skipped := skipper.ShouldSkipped(host)
+			sr, builtIn := serviceResolver.(*Resolver)
+			builtIn = builtIn && sr != nil && sr.domainClient != nil
+			var serviceAnswer *D.Msg
+			var serviceErr error
+			if builtIn && q.Qtype != D.TypeA && q.Qtype != D.TypeAAAA {
+				serviceRecord := q.Qtype == D.TypeHTTPS || q.Qtype == D.TypeSVCB
+				var direct bool
+				// Real-IP exclusions and ordinary records still need DIRECT routing.
+				// Other leaves keep their existing ordinary or tunnel DNS path.
+				serviceAnswer, direct, serviceErr = sr.domainClient.exchangeRouted(ctx, r, skipped || !serviceRecord)
+				if direct {
+					ctx.SetType(icontext.DNSTypeRaw)
+					if serviceErr != nil || skipped || !serviceRecord {
+						return serviceAnswer, serviceErr
+					}
+				}
+			}
+			if skipped {
 				return next(ctx, r)
 			}
 			if (q.Qtype == D.TypeA || q.Qtype == D.TypeAAAA) && !isFakeIPHostName(host) {
@@ -206,7 +224,11 @@ func withFakeIP(skipper *fakeip.Skipper, fakePool *fakeip.Pool, fakePool6 *fakei
 					msg, err = next(ctx, r)
 				} else {
 					ctx.SetType(icontext.DNSTypeRaw)
-					msg, err = serviceResolver.ExchangeContext(ctx, r)
+					if builtIn {
+						msg, err = serviceAnswer, serviceErr
+					} else {
+						msg, err = serviceResolver.ExchangeContext(ctx, r)
+					}
 					if err != nil {
 						// A service resolver that could not be reached must not
 						// be worse than having none configured: fall through to

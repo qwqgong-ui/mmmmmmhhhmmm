@@ -16,5 +16,11 @@ bundle 按最终节点名称和域名隔离，使用完整结果的最短 TTL；
 不支持扩展的旧节点回退普通服务记录查询，扩展不支持状态记忆 5 分钟。
 服务记录的节点查询失败后可顺序回退公共 DoH；这与地址预热的失败处理不同。
 
+查询域名按上述规则选中 DIRECT 时，TXT、MX、HTTPS/SVCB 等所有非 A/AAAA 记录
+统一交给 `direct-nameserver`，包括 `fake-ip-filter` 中配置为 `real-ip` 的域名。
+直连解析失败或未配置 `direct-nameserver` 时返回错误，不回退普通 `nameserver` 或公共 DoH。
+`direct-nameserver-follow-policy` 仍按原配置生效。Fake-IP 域名的 HTTPS/SVCB 地址提示
+继续改写，`real-ip` 域名保留原始记录；A/AAAA 和非 DIRECT 域名的处理保持原样。
+
 完整协议、缓存边界和匹配 Xray 的集成验证方法见
 [服务端域名 DNS bundle](../domain-dns-bundle.md)。服务端配套行为需要相应 Xray 实现，不能只升级客户端。
