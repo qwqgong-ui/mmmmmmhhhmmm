@@ -12,7 +12,7 @@ Before any build, test, benchmark, package, or release task:
 1. Build and test the checked-in `dev` source directly.
 2. Apply dependency patches with `patches/apply-dependency-patches.sh`.
 3. Use the downstream trimmed build tags:
-   `no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku no_fake_tcp`.
+   `no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku no_fake_tcp no_easytier`.
 4. Preserve the configured Go 1.27 / optimized build settings used by
    `.github/workflows/build.yml`.
 
