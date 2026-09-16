@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
+	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/config"
 	"github.com/metacubex/mihomo/listener"
@@ -140,18 +141,20 @@ func prepareRuntimeIPv6(cfg *config.Config) {
 }
 
 // startRuntimeIPv6MonitorLocked starts the OS network-change monitor when
-// IPv6 is configured and no monitor is already running. It is a no-op
+// no monitor is already running. It also invalidates leaf QUIC path hints,
+// including on IPv4-only networks. It is a no-op
 // (monitor stays nil) on Android and any other platform without an
 // implementation - see ipv6_monitor_other.go - since re-detection there is
 // left to the host application's own network-switch handling.
 func startRuntimeIPv6MonitorLocked() {
-	if !runtimeIPv6Controller.initialized || !runtimeIPv6Controller.configured || runtimeIPv6Controller.monitor != nil {
+	if !runtimeIPv6Controller.initialized || runtimeIPv6Controller.monitor != nil {
 		return
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	updates := make(chan struct{}, 1)
 	monitor, err := newRuntimeIPv6NetworkUpdateMonitor(func() {
+		dialer.NotifyNetworkChange()
 		select {
 		case updates <- struct{}{}:
 		default:

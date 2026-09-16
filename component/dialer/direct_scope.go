@@ -20,6 +20,7 @@ func SetDirectNetworkEnvironment(environment string) {
 	old := directNetworkEnvironment.Swap(environment)
 	dev_cache.SetEnvironment(environment)
 	if old != environment {
+		NotifyNetworkChange()
 		log.Fields(log.INFO, map[string]string{"subsystem": "network", "event": "scope_changed", "network_scope": EnvironmentScope(environment), "old_network_scope": EnvironmentScope(old), "reason": "platform_update"}, "Network cache partition changed")
 	}
 }

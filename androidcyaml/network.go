@@ -65,6 +65,7 @@ func SetSystemIPv6Available(available bool) {
 // FlushInterfaceCache drops cached interface lookups after a physical route
 // change.
 func FlushInterfaceCache() {
+	dialer.NotifyNetworkChange()
 	iface.FlushCache()
 }
 

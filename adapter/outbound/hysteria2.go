@@ -32,8 +32,9 @@ const defaultHopInterval = 30
 type Hysteria2 struct {
 	*Base
 
-	option *Hysteria2Option
-	client *hysteria2.Client
+	option   *Hysteria2Option
+	client   *hysteria2.Client
+	mtuCache common.MTUCache
 }
 
 type Hysteria2Option struct {
@@ -232,7 +233,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 			if err != nil {
 				return nil, nil, err
 			}
-			return common.DialQuic(ctx, addr, outbound.DialOptions(), dialer, tlsCfg, cfg, common.DialQuicOption{Early: early})
+			return common.DialQuic(ctx, addr, outbound.DialOptions(), dialer, tlsCfg, cfg, common.DialQuicOption{Early: early, MTUCache: &outbound.mtuCache})
 		}),
 		SetBBRCongestion: func(quicConn *quic.Conn) {
 			common.SetCongestionController(quicConn, "bbr", option.CWND, option.BBRProfile)

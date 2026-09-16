@@ -1,0 +1,169 @@
+diff --git a/config.go b/config.go
+index 7b565b1..c7a000b 100644
+--- a/config.go
++++ b/config.go
+@@ -122,6 +122,7 @@ func populateConfig(config *Config) *Config {
+ 		EnableDatagrams:                  config.EnableDatagrams,
+ 		InitialPacketSize:                initialPacketSize,
+ 		DisablePathMTUDiscovery:          config.DisablePathMTUDiscovery,
++		MTUDiscoveryCache:                config.MTUDiscoveryCache,
+ 		EnableStreamResetPartialDelivery: config.EnableStreamResetPartialDelivery,
+ 		Allow0RTT:                        config.Allow0RTT,
+ 		Tracer:                           config.Tracer,
+diff --git a/config_test.go b/config_test.go
+index 8b44a86..6da514a 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -124,6 +124,8 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
+ 			f.Set(reflect.ValueOf(uint16(1350)))
+ 		case "DisablePathMTUDiscovery":
+ 			f.Set(reflect.ValueOf(true))
++		case "MTUDiscoveryCache":
++			f.Set(reflect.ValueOf(new(MTUDiscoveryCache)))
+ 		case "Allow0RTT":
+ 			f.Set(reflect.ValueOf(true))
+ 		case "EnableStreamResetPartialDelivery":
+diff --git a/connection.go b/connection.go
+index c2733fe..4a31817 100644
+--- a/connection.go
++++ b/connection.go
+@@ -2451,12 +2451,16 @@ func (c *Conn) applyTransportParameters() {
+ 	if params.MaxUDPPayloadSize > 0 && params.MaxUDPPayloadSize < maxPacketSize {
+ 		maxPacketSize = params.MaxUDPPayloadSize
+ 	}
+-	c.mtuDiscoverer = newMTUDiscoverer(
++	finder := newMTUDiscoverer(
+ 		c.rttStats,
+ 		protocol.ByteCount(c.config.InitialPacketSize),
+ 		maxPacketSize,
+ 		c.qlogger,
+ 	)
++	if c.perspective == protocol.PerspectiveClient && !c.config.DisablePathMTUDiscovery {
++		finder.useCache(c.config.MTUDiscoveryCache)
++	}
++	c.mtuDiscoverer = finder
+ }
+ 
+ func (c *Conn) triggerSending(now monotime.Time) error {
+diff --git a/interface.go b/interface.go
+index 9954b72..eadc018 100644
+--- a/interface.go
++++ b/interface.go
+@@ -173,6 +173,9 @@ type Config struct {
+ 	// This allows the sending of QUIC packets that fully utilize the available MTU of the path.
+ 	// Path MTU discovery is only available on systems that allow setting of the Don't Fragment (DF) bit.
+ 	DisablePathMTUDiscovery bool
++	// MTUDiscoveryCache optionally reuses a leaf proxy's path MTU discoveries.
++	// It is used only by clients with path MTU discovery enabled.
++	MTUDiscoveryCache *MTUDiscoveryCache
+ 	// Allow0RTT allows the application to decide if a 0-RTT connection attempt should be accepted.
+ 	// Only valid for the server.
+ 	Allow0RTT bool
+diff --git a/mtu_discoverer.go b/mtu_discoverer.go
+index a63ff0a..71828fd 100644
+--- a/mtu_discoverer.go
++++ b/mtu_discoverer.go
+@@ -105,6 +105,12 @@ type mtuFinder struct {
+ 	generation uint8
+ 
+ 	qlogger qlogwriter.Recorder
++
++	cache           *MTUDiscoveryCache
++	cacheGeneration uint64
++	cached          mtuCacheResult
++	cachedProbe     bool
++	restored        bool
+ }
+ 
+ var _ mtuDiscoverer = &mtuFinder{}
+@@ -135,7 +141,7 @@ func (f *mtuFinder) init(start, max protocol.ByteCount) {
+ }
+ 
+ func (f *mtuFinder) done() bool {
+-	return f.max()-f.min <= maxMTUDiff+1
++	return f.restored || f.max()-f.min <= maxMTUDiff+1
+ }
+ 
+ func (f *mtuFinder) max() protocol.ByteCount {
+@@ -158,12 +164,19 @@ func (f *mtuFinder) ShouldSendProbe(now monotime.Time) bool {
+ 	if f.inFlight != protocol.InvalidByteCount || f.done() {
+ 		return false
+ 	}
++	// Validate the cached result immediately after the handshake.
++	if f.cached.size > 0 {
++		return true
++	}
+ 	return !now.Before(f.lastProbeTime.Add(mtuProbeDelay * f.rttStats.SmoothedRTT()))
+ }
+ 
+ func (f *mtuFinder) GetPing(now monotime.Time) (ackhandler.Frame, protocol.ByteCount) {
+ 	var size protocol.ByteCount
+-	if f.lastProbeWasLost {
++	f.cachedProbe = f.cached.size > 0
++	if f.cachedProbe {
++		size = f.cached.size
++	} else if f.lastProbeWasLost {
+ 		size = (f.min + f.lost[0]) / 2
+ 	} else {
+ 		size = (f.min + f.max()) / 2
+@@ -181,6 +194,14 @@ func (f *mtuFinder) CurrentSize() protocol.ByteCount {
+ }
+ 
+ func (f *mtuFinder) Reset(now monotime.Time, start, max protocol.ByteCount) {
++	// Migration must not reuse or update the previous path's cache.
++	if f.cache != nil {
++		f.cache.invalidate(f.cacheGeneration)
++	}
++	f.cache = nil
++	f.cached = mtuCacheResult{}
++	f.cachedProbe = false
++	f.restored = false
+ 	f.generation++
+ 	f.lastProbeTime = now
+ 	f.lastProbeWasLost = false
+@@ -207,6 +228,11 @@ func (h *mtuFinderAckHandler) OnAcked(wire.Frame) {
+ 	h.inFlight = protocol.InvalidByteCount
+ 	h.min = size
+ 	h.lastProbeWasLost = false
++	if h.cachedProbe {
++		h.restored = h.cached.done
++		h.cached = mtuCacheResult{}
++		h.cachedProbe = false
++	}
+ 	// remove all values smaller than size from the lost array
+ 	var j int
+ 	for i, v := range h.lost {
+@@ -224,6 +250,7 @@ func (h *mtuFinderAckHandler) OnAcked(wire.Frame) {
+ 			}
+ 		}
+ 	}
++	h.remember()
+ 	if h.qlogger != nil {
+ 		h.qlogger.RecordEvent(qlog.MTUUpdated{
+ 			Value: int(size),
+@@ -241,6 +268,19 @@ func (h *mtuFinderAckHandler) OnLost(wire.Frame) {
+ 	if size == protocol.InvalidByteCount {
+ 		panic("OnLost callback called although there's no MTU probe packet in flight")
+ 	}
++	if h.cachedProbe {
++		// Data packets still use the initial size. Retry regular discovery,
++		// without treating an old path's hint as the new path's upper bound.
++		if h.cache.invalidate(h.cacheGeneration) {
++			h.cacheGeneration++
++		} else {
++			h.cache = nil
++		}
++		h.cached = mtuCacheResult{}
++		h.cachedProbe = false
++		h.inFlight = protocol.InvalidByteCount
++		return
++	}
+ 	h.lastProbeWasLost = true
+ 	h.inFlight = protocol.InvalidByteCount
+ 	for i, v := range h.lost {
+@@ -250,4 +290,5 @@ func (h *mtuFinderAckHandler) OnLost(wire.Frame) {
+ 			break
+ 		}
+ 	}
++	h.remember()
+ }

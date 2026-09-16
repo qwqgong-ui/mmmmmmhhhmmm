@@ -19,6 +19,7 @@ type PacketDialer interface {
 type DialQuicOption struct {
 	Early              bool
 	ConnectionIDLength int
+	MTUCache           *MTUCache
 }
 
 func DialQuic(ctx context.Context, address string, opts []dialer.Option, pDialer PacketDialer, tlsConf *tls.Config, conf *quic.Config, option DialQuicOption) (net.PacketConn, *quic.Conn, error) {
@@ -42,10 +43,11 @@ func DialQuic(ctx context.Context, address string, opts []dialer.Option, pDialer
 			transport.SetSingleUse(true)   // auto close transport
 
 			var quicConn *quic.Conn
+			pathConf := option.MTUCache.config(conf, addrPort.Addr())
 			if option.Early {
-				quicConn, err = transport.DialEarly(ctx, udpAddr, tlsConf, conf)
+				quicConn, err = transport.DialEarly(ctx, udpAddr, tlsConf, pathConf)
 			} else {
-				quicConn, err = transport.Dial(ctx, udpAddr, tlsConf, conf)
+				quicConn, err = transport.Dial(ctx, udpAddr, tlsConf, pathConf)
 			}
 			if err != nil {
 				_ = packetConn.Close()

@@ -6,6 +6,8 @@
 
 状态切换通过 `hub/executor` mux 与 `resolver.DisableIPv6`（`atomic.Bool`）原子完成，重建对应 DNS 路径，并对 Mihomo 自建 TUN 增删 IPv6 配置。Android 核心不启动网络监听，由宿主的网络切换流程负责重新加载；外部传入文件描述符的 TUN（Android 等）不会被重启，以免关闭宿主 VPN 会话。REST API 的 `PATCH /configs` 的 `ipv6`/`tun` 字段现在都经过该控制器，而不是直接改写 resolver 或监听器。
 
+桌面网络监听也负责刷新 HY2 叶节点的 MTU 缓存，因此 `ipv6: false` 时仍监听网络事件，但不会启用 IPv6。
+
 Patches:
 
 - `component/dialer.patch`

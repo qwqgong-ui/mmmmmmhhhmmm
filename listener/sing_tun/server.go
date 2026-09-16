@@ -363,6 +363,7 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		lastNetworkStatus := dialer.CurrentNetworkStatus()
 		var networkScopeMu sync.Mutex
 		defaultInterfaceMonitor.RegisterCallback(func(defaultInterface *control.Interface, event int) {
+			dialer.NotifyNetworkChange()
 			iface.FlushCache()
 			status := dialer.CurrentNetworkStatus()
 			if defaultInterface == nil {
