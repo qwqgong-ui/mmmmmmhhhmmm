@@ -1,0 +1,37 @@
+From 9c56457b36f5f31a29a83b03c3932296b1e61445 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 17 Sep 2026 00:34:28 -0700
+Subject: [PATCH] hysteria2: deliver received datagrams in order
+
+---
+ hysteria2/client_packet.go | 14 ++++++++------
+ 1 file changed, 8 insertions(+), 6 deletions(-)
+
+diff --git a/hysteria2/client_packet.go b/hysteria2/client_packet.go
+index a016042..aadd745 100644
+--- a/hysteria2/client_packet.go
++++ b/hysteria2/client_packet.go
+@@ -9,12 +9,14 @@ func (c *Client) loopMessages(conn *clientQUICConnection) {
+ 			conn.closeWithError(E.Cause(err, "receive message"))
+ 			return
+ 		}
+-		go func() {
+-			hErr := c.handleMessage(conn, message)
+-			if hErr != nil {
+-				conn.closeWithError(E.Cause(hErr, "handle message"))
+-			}
+-		}()
++		// Handle datagrams on the receive loop. A goroutine per datagram lets
++		// back-to-back packets overtake each other; handling never blocks
++		// because inputPacket drops instead of waiting on a full queue.
++		hErr := c.handleMessage(conn, message)
++		if hErr != nil {
++			conn.closeWithError(E.Cause(hErr, "handle message"))
++			return
++		}
+ 	}
+ }
+ 
+-- 
+2.55.0
+
