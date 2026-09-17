@@ -12,7 +12,12 @@ VERSION=$(shell git rev-parse --short HEAD)
 endif
 
 BUILDTIME=$(shell date -u)
-GOBUILD=CGO_ENABLED=0 go build -tags with_gvisor -trimpath -ldflags '-X "github.com/metacubex/mihomo/constant.Version=$(VERSION)" \
+# Downstream build: must match .github/workflows/build.yml (see SKILL.md).
+# Dependency patches are applied first; with_gvisor is intentionally not used.
+TAGS=no_tailscale no_zerotier no_wireguard no_openvpn no_mieru no_sudoku no_fake_tcp no_easytier
+GOBUILD=GOFLAGS="$$(sh patches/apply-dependency-patches.sh | sed -n 's/^GOFLAGS=//p')" \
+		CGO_ENABLED=0 GOEXPERIMENT=simd go build -tags "$(TAGS)" -trimpath \
+		-ldflags '-X "github.com/metacubex/mihomo/constant.Version=$(VERSION)" \
 		-X "github.com/metacubex/mihomo/constant.BuildTime=$(BUILDTIME)" \
 		-w -s -buildid='
 
@@ -61,6 +66,13 @@ all:linux-amd64-v3 linux-arm64\
 	darwin-amd64-v3 darwin-arm64\
  	windows-amd64-v3 windows-arm64\
 
+
+# Build linux-amd64-v3 with the CI settings and replace the local mihomo service binary.
+local: linux-amd64-v3
+	sudo install -m755 $(BINDIR)/$(NAME)-linux-amd64-v3 /usr/bin/mihomo
+	sudo systemctl restart mihomo
+	systemctl is-active mihomo
+	mihomo -v
 
 darwin-all: darwin-amd64-v3 darwin-arm64
 
