@@ -37,6 +37,19 @@ Do not:
 
 CMFA update automation is intentionally disabled and must not be restored.
 
+## Profile-guided optimization
+
+`default.pgo` at the repository root is a CPU profile of the Linux amd64-v3
+build under real proxy traffic. `go build` in the root package picks it up
+automatically (`-pgo=auto`), so every `.github/workflows/build.yml` target uses
+it without extra flags. Do not pass `-pgo=off` for release builds.
+
+Refresh it after large hot-path changes: capture
+`/debug/pprof/profile?seconds=300` from a running downstream build (the
+profiler route is only mounted when the process starts with `log-level: debug`)
+and replace `default.pgo`. Profiles contain only function names and sample
+counts; never merge one taken from a build with local-only source changes.
+
 ## CI testing
 
 Pull requests into `dev` and pushes to `dev` test the expanded source directly,
