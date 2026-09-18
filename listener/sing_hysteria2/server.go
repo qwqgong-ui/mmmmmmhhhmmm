@@ -200,11 +200,9 @@ func New(config LC.Hysteria2Server, lc C.InboundListenConfig, tunnel C.Tunnel, a
 		}
 	}
 
-	if config.UdpMTU == 0 {
-		// "1200" from quic-go's MaxDatagramSize
-		// "-3" from quic-go's DatagramFrame.MaxDataLen
-		config.UdpMTU = 1200 - 3
-	}
+	// udp-mtu is left at 0 unless the user pinned one: sing-quic then sizes each
+	// UDP fragment from the connection's current datagram limit, which path MTU
+	// discovery raises past the 1197 bytes a fixed default could assume.
 
 	quicConfig := &quic.Config{
 		InitialStreamReceiveWindow:     config.InitialStreamReceiveWindow,

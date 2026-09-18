@@ -194,11 +194,9 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		return nil, err
 	}
 
-	if option.UdpMTU == 0 {
-		// "1200" from quic-go's MaxDatagramSize
-		// "-3" from quic-go's DatagramFrame.MaxDataLen
-		option.UdpMTU = 1200 - 3
-	}
+	// udp-mtu is left at 0 unless the user pinned one: sing-quic then sizes each
+	// UDP fragment from the connection's current datagram limit, which path MTU
+	// discovery raises past the 1197 bytes a fixed default could assume.
 
 	quicConfig := &quic.Config{
 		// Dial with QUIC v2 (RFC 9369). This must stay a single version:

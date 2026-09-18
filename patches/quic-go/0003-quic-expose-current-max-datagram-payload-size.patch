@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 17 Sep 2026 22:50:00 +0900
+Subject: [PATCH] quic: expose the current maximum datagram payload size
+
+SendDatagram already knows the largest payload it will accept, but only reveals it by rejecting an oversized send with DatagramTooLargeError. A caller that fragments its own payloads into datagrams has to either pin a conservative constant or burn one rejected send per packet to discover the real bound. Neither follows path MTU discovery, so a path that has validated a 1441-byte packet keeps carrying fragments sized for 1200. Factor the computation out and export it, leaving DatagramTooLargeError authoritative for the race where the estimate drops after the caller read it.
+---
+diff --git a/connection.go b/connection.go
+index 4a31817..ebc8bef 100644
+--- a/connection.go
++++ b/connection.go
+@@ -3045,19 +3045,41 @@ func (c *Conn) SendDatagram(p []byte) error {
+ 		return errors.New("datagram support disabled")
+ 	}
+ 
++	maxDataLen := c.maxDatagramPayloadSize()
++	if protocol.ByteCount(len(p)) > maxDataLen {
++		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
++	}
++	f := &wire.DatagramFrame{DataLenPresent: true}
++	f.Data = make([]byte, len(p))
++	copy(f.Data, p)
++	return c.datagramQueue.Add(f)
++}
++
++func (c *Conn) maxDatagramPayloadSize() protocol.ByteCount {
+ 	f := &wire.DatagramFrame{DataLenPresent: true}
+ 	// The payload size estimate is conservative.
+ 	// Under many circumstances we could send a few more bytes.
+-	maxDataLen := utils.Min(
++	return utils.Min(
+ 		f.MaxDataLen(c.peerParams.MaxDatagramFrameSize, c.version),
+ 		protocol.ByteCount(c.maxPayloadSizeEstimate.Load()),
+ 	)
+-	if protocol.ByteCount(len(p)) > maxDataLen {
+-		return &DatagramTooLargeError{MaxDatagramPayloadSize: int64(maxDataLen)}
++}
++
++// MaxDatagramPayloadSize reports the largest payload SendDatagram accepts right
++// now, or 0 if the peer did not enable datagram support. Callers that carve
++// their own datagrams into fragments need this to size them: the limit tracks
++// path MTU discovery, so it grows as the connection validates larger packets
++// and a caller pinned to a fixed size would keep fragmenting payloads the path
++// has since proven it can carry whole.
++//
++// The value is a snapshot. A fragment sized from it can still be rejected if
++// the estimate drops in between, so SendDatagram's DatagramTooLargeError stays
++// the authority.
++func (c *Conn) MaxDatagramPayloadSize() int64 {
++	if !c.supportsDatagrams() {
++		return 0
+ 	}
+-	f.Data = make([]byte, len(p))
+-	copy(f.Data, p)
+-	return c.datagramQueue.Add(f)
++	return int64(c.maxDatagramPayloadSize())
+ }
+ 
+ // ReceiveDatagram gets a message received in a QUIC datagram, as specified in RFC 9221.

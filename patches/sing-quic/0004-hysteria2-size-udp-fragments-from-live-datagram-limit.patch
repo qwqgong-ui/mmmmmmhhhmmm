@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Thu, 17 Sep 2026 22:55:00 +0900
+Subject: [PATCH] hysteria2: size UDP fragments from the live datagram limit
+
+udpMTU was a constant chosen for the smallest path QUIC must support, so every relayed UDP datagram larger than it was split in two even after path MTU discovery validated a 1441-byte packet. That doubles the packet rate for the same bytes, which matters on links metered by packets per second rather than bandwidth. Read the connection's current datagram limit per write instead, and keep a configured udpMTU as a cap for operators who deliberately pinned a smaller one. DatagramTooLargeError still re-fragments if the limit drops between the read and the send.
+---
+diff --git a/hysteria2/packet.go b/hysteria2/packet.go
+index 554c3b4..04728cd 100644
+--- a/hysteria2/packet.go
++++ b/hysteria2/packet.go
+@@ -89,6 +89,14 @@ func fragUDPMessage(message *udpMessage, maxPacketSize int) []*udpMessage {
+ 	if message.data.Len() <= udpMTU {
+ 		return []*udpMessage{message}
+ 	}
++	if udpMTU <= 0 {
++		// No room for even one byte beside the header, so no split can make
++		// this message fit. Hand it back whole and let the send report the
++		// limit rather than looping forever on a fragment size of zero. The
++		// size now comes from the peer's datagram limit, so a peer advertising
++		// less than a long destination's header can reach this.
++		return []*udpMessage{message}
++	}
+ 	var fragments []*udpMessage
+ 	originPacket := message.data.Bytes()
+ 	for remaining := len(originPacket); remaining > 0; remaining -= udpMTU {
+@@ -144,6 +152,31 @@ func newUDPPacketConn(ctx context.Context, quicConn *quic.Conn, onDestroy func()
+ 	}
+ }
+ 
++// fallbackUDPMTU is the message size used when the connection cannot report one
++// yet: 1200 is the QUIC minimum every path must carry, less the DATAGRAM frame
++// header. It is a floor for the handshake window, not a target.
++const fallbackUDPMTU = 1200 - 3
++
++// maxPacketSize is the largest packed message the connection will currently
++// carry in one datagram. Path MTU discovery raises the connection's limit as it
++// validates larger packets, so reading it per write keeps fragments as large as
++// the path has proven it can take; a fixed size would keep splitting payloads
++// long after the path grew. A configured udpMTU caps the result, so an operator
++// who pinned a smaller size for a path that punishes big datagrams still gets it.
++func (c *udpPacketConn) maxPacketSize() int {
++	return clampUDPMTU(int(c.quicConn.MaxDatagramPayloadSize()), c.udpMTU)
++}
++
++func clampUDPMTU(live, configured int) int {
++	if live <= 0 {
++		live = fallbackUDPMTU
++	}
++	if configured > 0 && configured < live {
++		return configured
++	}
++	return live
++}
++
+ func (c *udpPacketConn) ReadPacket(buffer *buf.Buffer) (destination M.Socksaddr, err error) {
+ 	select {
+ 	case p := <-c.data:
+@@ -198,8 +231,9 @@ func (c *udpPacketConn) WritePacket(buffer *buf.Buffer, destination M.Socksaddr)
+ 	}
+ 	defer message.releaseMessage()
+ 	var err error
+-	if buffer.Len() > c.udpMTU-message.headerSize() {
+-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
++	maxPacketSize := c.maxPacketSize()
++	if buffer.Len() > maxPacketSize-message.headerSize() {
++		err = c.writePackets(fragUDPMessage(message, maxPacketSize))
+ 	} else {
+ 		err = c.writePacket(message)
+ 	}
+@@ -232,8 +266,9 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+ 		data:          buf.As(p),
+ 	}
+ 	defer message.releaseMessage()
+-	if len(p) > c.udpMTU-message.headerSize() {
+-		err = c.writePackets(fragUDPMessage(message, c.udpMTU))
++	maxPacketSize := c.maxPacketSize()
++	if len(p) > maxPacketSize-message.headerSize() {
++		err = c.writePackets(fragUDPMessage(message, maxPacketSize))
+ 		if err == nil {
+ 			return len(p), nil
+ 		}
+diff --git a/hysteria2/packet_mtu_test.go b/hysteria2/packet_mtu_test.go
+new file mode 100644
+index 0000000..ef4e667
+--- /dev/null
++++ b/hysteria2/packet_mtu_test.go
+@@ -0,0 +1,71 @@
++package hysteria2
++
++import (
++	"testing"
++
++	"github.com/metacubex/sing/common/buf"
++)
++
++func TestClampUDPMTU(t *testing.T) {
++	for _, tc := range []struct {
++		name       string
++		live       int
++		configured int
++		want       int
++	}{
++		{
++			// The point of the change: a path that validated a 1441-byte
++			// packet must carry ~1400-byte messages whole, not keep splitting
++			// them at the 1197 the old fixed default used.
++			name: "follows the connection when nothing is configured",
++			live: 1400, configured: 0, want: 1400,
++		},
++		{
++			name: "grows with the connection",
++			live: 1197, configured: 0, want: 1197,
++		},
++		{
++			name: "configured size caps a larger connection limit",
++			live: 1400, configured: 1200, want: 1200,
++		},
++		{
++			// A configured size is a cap, never a promise: exceeding what the
++			// connection accepts would just earn a DatagramTooLargeError.
++			name: "configured size does not raise a smaller connection limit",
++			live: 1100, configured: 1400, want: 1100,
++		},
++		{
++			name: "falls back before the connection reports a limit",
++			live: 0, configured: 0, want: fallbackUDPMTU,
++		},
++		{
++			name: "configured size still caps the fallback",
++			live: 0, configured: 900, want: 900,
++		},
++		{
++			name: "negative connection limit is treated as unknown",
++			live: -1, configured: 0, want: fallbackUDPMTU,
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			if got := clampUDPMTU(tc.live, tc.configured); got != tc.want {
++				t.Fatalf("clampUDPMTU(%d, %d) = %d, want %d", tc.live, tc.configured, got, tc.want)
++			}
++		})
++	}
++}
++
++// A peer may advertise a datagram limit smaller than a long destination's
++// header. No fragment size can make such a message fit, so fragUDPMessage must
++// hand it back whole for the send to reject, rather than loop on a fragment
++// size of zero.
++func TestFragUDPMessageHeaderExceedsLimit(t *testing.T) {
++	message := &udpMessage{
++		destination: "a-very-long-destination-name.example.test:65535",
++		data:        buf.As(make([]byte, 512)),
++	}
++	fragments := fragUDPMessage(message, message.headerSize())
++	if len(fragments) != 1 || fragments[0] != message {
++		t.Fatalf("got %d fragments, want the original message back", len(fragments))
++	}
++}
