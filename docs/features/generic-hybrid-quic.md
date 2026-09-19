@@ -10,4 +10,7 @@ Shadowsocks、HY2 等流代理，DIRECT、REJECT 和仅承载 IP 的隧道不能
 探测超时、raw socket 失败或 15 秒没有 raw 回复后，本会话永久回到可靠流，网络恢复也不会自动切回。
 协议为 `HQS1`，不兼容旧 HY2 `HQV3`，两端需配套升级。
 
+raw socket 的连接化、缓冲区、每包分配和计数见
+[raw 路径的连接化与零分配](hybrid-quic-raw-socket.md)。
+
 配置、Xray 多跳转发、源地址限制和 TCP 队头阻塞说明见 [Hybrid QUIC](../hybrid-quic.md)。

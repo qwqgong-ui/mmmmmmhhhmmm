@@ -13,16 +13,91 @@ import (
 )
 
 type FlowSnapshot struct {
-	FlowID       string  `json:"flowId"`
-	State        string  `json:"state"`
-	Target       string  `json:"target"`
-	Proxy        string  `json:"proxy,omitempty"`
-	NetworkScope string  `json:"networkScope,omitempty"`
-	RawEndpoint  string  `json:"rawEndpoint,omitempty"`
-	IdleMillis   int64   `json:"idleMs"`
-	ProbeCount   uint64  `json:"probeCount"`
-	RawRTTMillis float64 `json:"rawRttMs,omitempty"`
-	Reason       string  `json:"reason,omitempty"`
+	FlowID       string   `json:"flowId"`
+	State        string   `json:"state"`
+	Target       string   `json:"target"`
+	Proxy        string   `json:"proxy,omitempty"`
+	NetworkScope string   `json:"networkScope,omitempty"`
+	RawEndpoint  string   `json:"rawEndpoint,omitempty"`
+	RawConnected bool     `json:"rawConnected"`
+	IdleMillis   int64    `json:"idleMs"`
+	ProbeCount   uint64   `json:"probeCount"`
+	RawRTTMillis float64  `json:"rawRttMs,omitempty"`
+	Reason       string   `json:"reason,omitempty"`
+	Counters     Counters `json:"counters"`
+}
+
+// Counters report where a flow's datagrams actually went. Raw and stream cover
+// the same flow, so their sum is all of its traffic; a flow on raw still sends
+// long-header packets over the stream. Dropped and errors exist only on raw:
+// dropped counts datagrams from another source or without a short header, and
+// errors the ICMP messages a connected raw socket reports, none of which are
+// by themselves a reason to fall back.
+type Counters struct {
+	RawTxPackets    uint64 `json:"rawTxPackets"`
+	RawRxPackets    uint64 `json:"rawRxPackets"`
+	RawTxBytes      uint64 `json:"rawTxBytes"`
+	RawRxBytes      uint64 `json:"rawRxBytes"`
+	StreamTxPackets uint64 `json:"streamTxPackets"`
+	StreamRxPackets uint64 `json:"streamRxPackets"`
+	StreamTxBytes   uint64 `json:"streamTxBytes"`
+	StreamRxBytes   uint64 `json:"streamRxBytes"`
+	RawDropped      uint64 `json:"rawDropped"`
+	RawErrors       uint64 `json:"rawErrors"`
+}
+
+func (c *Counters) add(o Counters) {
+	c.RawTxPackets += o.RawTxPackets
+	c.RawRxPackets += o.RawRxPackets
+	c.RawTxBytes += o.RawTxBytes
+	c.RawRxBytes += o.RawRxBytes
+	c.StreamTxPackets += o.StreamTxPackets
+	c.StreamRxPackets += o.StreamRxPackets
+	c.StreamTxBytes += o.StreamTxBytes
+	c.StreamRxBytes += o.StreamRxBytes
+	c.RawDropped += o.RawDropped
+	c.RawErrors += o.RawErrors
+}
+
+// Counters are indexed so that the per-packet path is a single atomic add and
+// folding a finished flow into the process totals is a loop.
+type counter int
+
+const (
+	rawTxPackets counter = iota
+	rawRxPackets
+	rawTxBytes
+	rawRxBytes
+	streamTxPackets
+	streamRxPackets
+	streamTxBytes
+	streamRxBytes
+	rawDropped
+	rawErrors
+	counterCount
+)
+
+type counters [counterCount]atomic.Uint64
+
+func (c *counters) fold(o *counters) {
+	for i := range o {
+		c[i].Add(o[i].Load())
+	}
+}
+
+func (c *counters) snapshot() Counters {
+	return Counters{
+		RawTxPackets:    c[rawTxPackets].Load(),
+		RawRxPackets:    c[rawRxPackets].Load(),
+		RawTxBytes:      c[rawTxBytes].Load(),
+		RawRxBytes:      c[rawRxBytes].Load(),
+		StreamTxPackets: c[streamTxPackets].Load(),
+		StreamRxPackets: c[streamRxPackets].Load(),
+		StreamTxBytes:   c[streamTxBytes].Load(),
+		StreamRxBytes:   c[streamRxBytes].Load(),
+		RawDropped:      c[rawDropped].Load(),
+		RawErrors:       c[rawErrors].Load(),
+	}
 }
 
 type StatsSnapshot struct {
@@ -34,6 +109,7 @@ type StatsSnapshot struct {
 	ProbeFlows       uint64            `json:"probeFlows"`
 	RawSuccesses     uint64            `json:"rawSuccesses"`
 	SuccessRate      float64           `json:"successRate"`
+	Counters         Counters          `json:"counters"`
 	Fallbacks        map[string]uint64 `json:"fallbackReasons"`
 }
 
@@ -45,6 +121,7 @@ type flowDiagnostic struct {
 	closed       bool
 	firstProbe   time.Time
 	lastActivity atomic.Int64
+	counters     counters
 }
 
 var diagnostics = struct {
@@ -55,6 +132,7 @@ var diagnostics = struct {
 var nextFlowID atomic.Uint64
 var rawSuccesses atomic.Uint64
 var probeFlows atomic.Uint64
+var totals counters // finished flows only; live ones are summed on demand
 
 func newFlowDiagnostic(target, proxy, scope string) *flowDiagnostic {
 	d := &flowDiagnostic{FlowSnapshot: FlowSnapshot{FlowID: fmt.Sprintf("hq-%x", nextFlowID.Add(1)), State: "registering", Target: target, Proxy: proxy, NetworkScope: scope}}
@@ -66,6 +144,21 @@ func newFlowDiagnostic(target, proxy, scope string) *flowDiagnostic {
 }
 
 func (d *flowDiagnostic) touch(now time.Time) { d.lastActivity.Store(now.UnixNano()) }
+
+// count records one datagram against a packet counter and its bytes; countOne
+// records an event that has no size. Both run per packet and take no lock.
+func (d *flowDiagnostic) count(packets, bytes counter, n int) {
+	d.counters[packets].Add(1)
+	d.counters[bytes].Add(uint64(n))
+}
+
+func (d *flowDiagnostic) countOne(c counter) { d.counters[c].Add(1) }
+
+func (d *flowDiagnostic) setRawConnected(connected bool) {
+	d.mu.Lock()
+	d.RawConnected = connected
+	d.mu.Unlock()
+}
 
 // Called only at transitions/probes, never on steady-state raw packets.
 // Permanent fallback is latched: peer acknowledgements and late callbacks
@@ -117,7 +210,14 @@ func (d *flowDiagnostic) update(state, endpoint, reason string, probe bool) {
 
 func (d *flowDiagnostic) close() {
 	d.mu.Lock()
-	d.closed = true
+	if !d.closed {
+		d.closed = true
+		// Hand this flow's totals over before it leaves the registry, which is
+		// what keeps the process-wide figures once it is gone. Datagrams its
+		// goroutines are still delivering are lost to them; these are
+		// diagnostics, not accounting.
+		totals.fold(&d.counters)
+	}
 	diagnostics.Lock()
 	delete(diagnostics.flows, d.FlowID)
 	diagnostics.Unlock()
@@ -137,6 +237,11 @@ func FlowSnapshotsFor(host, port, proxy string) []FlowSnapshot {
 	for _, d := range flows {
 		d.mu.Lock()
 		f, closed := d.FlowSnapshot, d.closed
+		if !closed {
+			// Under the same lock as closed, so a flow folded into the totals
+			// is never also counted here.
+			f.Counters = d.counters.snapshot()
+		}
 		d.mu.Unlock()
 		h, p, _ := net.SplitHostPort(f.Target)
 		if closed || (host != "" && !strings.EqualFold(strings.TrimSuffix(h, "."), strings.TrimSuffix(host, "."))) || (port != "" && p != port) || (proxy != "" && f.Proxy != proxy) {
@@ -150,7 +255,7 @@ func FlowSnapshotsFor(host, port, proxy string) []FlowSnapshot {
 }
 
 func Stats() StatsSnapshot {
-	s := StatsSnapshot{FlowsStarted: nextFlowID.Load(), ProbeFlows: probeFlows.Load(), RawSuccesses: rawSuccesses.Load(), Fallbacks: make(map[string]uint64)}
+	s := StatsSnapshot{FlowsStarted: nextFlowID.Load(), ProbeFlows: probeFlows.Load(), RawSuccesses: rawSuccesses.Load(), Counters: totals.snapshot(), Fallbacks: make(map[string]uint64)}
 	if s.FlowsStarted > 0 {
 		s.SuccessRate = float64(s.RawSuccesses) / float64(s.FlowsStarted)
 	}
@@ -165,6 +270,7 @@ func Stats() StatsSnapshot {
 		case "tunnel":
 			s.TunnelFlows++
 		}
+		s.Counters.add(f.Counters)
 	}
 	diagnostics.RLock()
 	for k, v := range diagnostics.fallbacks {

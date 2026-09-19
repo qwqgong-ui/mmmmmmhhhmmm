@@ -8,14 +8,21 @@ import (
 	"net/netip"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/log"
 )
 
 const probeInterval = 250 * time.Millisecond
 const probeTimeout = 3 * time.Second
 const rawSilence = 15 * time.Second
+
+// readBuffer holds one datagram while it is copied into a pooled buffer sized
+// to the datagram, so a 64 KiB receive buffer is allocated per flow and never
+// per packet.
+const readBuffer = 65536
 
 type ClientOptions struct {
 	Proxy, NetworkScope string
@@ -38,25 +45,33 @@ type PacketConn struct {
 	writeDeadline   time.Time
 }
 type clientFlow struct {
-	owner                        *PacketConn
-	ready                        chan struct{}
-	err                          error
-	stream                       net.Conn
-	raw                          net.PacketConn
-	relay                        netip.AddrPort
-	target                       netip.AddrPort
-	writeMu                      sync.Mutex
-	mu                           sync.Mutex
-	disabled, active             bool
-	probeEnd, nextProbe, lastRaw time.Time
-	disableNotified              bool // protected by writeMu
-	done                         chan struct{}
-	diagnostic                   *flowDiagnostic
+	owner  *PacketConn
+	ready  chan struct{}
+	err    error
+	stream net.Conn
+	raw    *rawSocket
+	relay  netip.AddrPort
+	target netip.AddrPort
+	// targetAddr is the address every received datagram is reported from. It
+	// is read-only after registration and shared by all of them, so delivery
+	// allocates no address.
+	targetAddr *net.UDPAddr
+	writeMu    sync.Mutex
+	// The receive path must not wait behind a send to record raw activity, so
+	// these are atomic rather than guarded. Every reader tests disabled first,
+	// which is what keeps an activation racing a fallback from reviving raw.
+	disabled, active    atomic.Bool
+	lastRaw             atomic.Int64 // last raw reply, unix nanoseconds; zero until the first
+	probeEnd, nextProbe time.Time    // protected by writeMu
+	disableNotified     bool         // protected by writeMu
+	done                chan struct{}
+	diagnostic          *flowDiagnostic
 }
 type result struct {
-	p   []byte
-	a   net.Addr
-	err error
+	p      []byte
+	a      net.Addr
+	err    error
+	pooled bool // p returns to the pool once ReadFrom has copied it out
 }
 
 func NewPacketConn(opts ClientOptions) *PacketConn {
@@ -163,15 +178,18 @@ func (f *clientFlow) open(address string) {
 		fail(errors.New("hybrid: invalid resolved target"))
 		return
 	}
+	f.targetAddr = net.UDPAddrFromAddrPort(f.target)
 	f.relay, err = netip.ParseAddrPort(relay)
 	if err != nil || f.relay.Port() != 443 {
 		fail(errors.New("hybrid: invalid relay"))
 		return
 	}
 	if Public(f.relay.Addr()) {
-		f.raw, _ = c.opts.Raw(ctx, f.relay)
+		if pc, rawErr := c.opts.Raw(ctx, f.relay); rawErr == nil && pc != nil {
+			f.raw = newRawSocket(pc, f.relay)
+		}
 	}
-	f.disabled = f.raw == nil
+	f.disabled.Store(f.raw == nil)
 	// Stop the setup timer before handing the stream to its lifetime owner.
 	if !stop() || ctx.Err() != nil {
 		if f.raw != nil {
@@ -193,6 +211,7 @@ func (f *clientFlow) open(address string) {
 	f.stream = stream
 	stream.SetWriteDeadline(c.writeDeadline)
 	c.mu.Unlock()
+	f.diagnostic.setRawConnected(f.raw != nil && f.raw.connected())
 	f.diagnostic.update("tunnel", f.relay.String(), "", false)
 	if log.Enabled(log.DEBUG) {
 		log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "hqs1_registered", "flow_id": f.diagnostic.FlowID, "host": address}, "HQS1 registered target=%s raw_endpoint=%s", f.target, f.relay)
@@ -213,10 +232,8 @@ func (f *clientFlow) disable(notify bool, reason string) error {
 }
 
 func (f *clientFlow) disableLocked(notify bool, reason string) error {
-	f.mu.Lock()
-	f.disabled = true
-	f.active = false
-	f.mu.Unlock()
+	f.disabled.Store(true)
+	f.active.Store(false)
 	f.diagnostic.update("tunnel", "", reason, false)
 	// A permanent fallback sends at most one disable frame, including setup
 	// failure. A peer acknowledgement must not overwrite the original reason.
@@ -233,15 +250,12 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
 	now := time.Now()
-	f.mu.Lock()
-	disable := false
-	disableReason := ""
+	reason := ""
 	raw, probe := false, false
-	if !f.disabled && Short(p) {
-		if f.active {
-			if !f.lastRaw.IsZero() && now.Sub(f.lastRaw) >= rawSilence {
-				disable = true
-				disableReason = "raw_silence"
+	if !f.disabled.Load() && Short(p) {
+		if f.active.Load() {
+			if last := f.lastRaw.Load(); last != 0 && now.UnixNano()-last >= int64(rawSilence) {
+				reason = "raw_silence"
 			} else {
 				raw = true
 			}
@@ -250,26 +264,21 @@ func (f *clientFlow) write(p []byte) (int, error) {
 				f.probeEnd = now.Add(probeTimeout)
 			}
 			if !now.Before(f.probeEnd) {
-				disable = true
-				disableReason = "probe_timeout"
+				reason = "probe_timeout"
 			} else if !now.Before(f.nextProbe) {
 				probe = true
 				f.nextProbe = now.Add(probeInterval)
 			}
 		}
 	}
-	if disable {
-		f.disabled = true
-		f.active = false
-	}
-	f.mu.Unlock()
-	if disable {
-		if err := f.disableLocked(true, disableReason); err != nil {
+	if reason != "" {
+		if err := f.disableLocked(true, reason); err != nil {
 			return 0, err
 		}
 	}
 	if raw {
-		if _, err := f.raw.WriteTo(p, net.UDPAddrFromAddrPort(f.relay)); err == nil {
+		if _, err := f.raw.write(p); err == nil {
+			f.diagnostic.count(rawTxPackets, rawTxBytes, len(p))
 			f.diagnostic.touch(now)
 			return len(p), nil
 		}
@@ -280,13 +289,16 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	if err := WriteFrame(f.stream, p); err != nil {
 		return 0, err
 	}
+	f.diagnostic.count(streamTxPackets, streamTxBytes, len(p))
 	f.diagnostic.touch(now)
 	if probe {
 		f.diagnostic.update("probing", f.relay.String(), "", true)
-		if _, err := f.raw.WriteTo(p, net.UDPAddrFromAddrPort(f.relay)); err != nil {
+		if _, err := f.raw.write(p); err != nil {
 			if err = f.disableLocked(true, "probe_write_error"); err != nil {
 				return 0, err
 			}
+		} else {
+			f.diagnostic.count(rawTxPackets, rawTxBytes, len(p))
 		}
 	}
 	return len(p), nil
@@ -313,19 +325,28 @@ func (f *clientFlow) readStream() {
 			f.disable(false, "peer_disabled_raw")
 			continue
 		}
+		f.diagnostic.count(streamRxPackets, streamRxBytes, len(p))
 		f.diagnostic.touch(time.Now())
-		f.owner.deliver(result{p: p, a: net.UDPAddrFromAddrPort(f.target)})
+		f.owner.deliver(result{p: p, a: f.targetAddr})
 	}
 }
 func (f *clientFlow) readRaw() {
-	b := make([]byte, 65536)
+	b := pool.Get(readBuffer)
+	defer pool.Put(b)
 	for {
-		n, a, err := f.raw.ReadFrom(b)
+		n, fromRelay, err := f.raw.read(b)
 		if err != nil {
 			select {
 			case <-f.done:
 				return
 			default:
+			}
+			if transientError(err) {
+				// An ICMP message about a single datagram, which only a
+				// connected socket sees. The socket still works, so the probe
+				// and silence timeouts stay the only reasons to fall back.
+				f.diagnostic.countOne(rawErrors)
+				continue
 			}
 			if f.owner.ctx.Err() == nil {
 				if err = f.disable(true, "socket_read_error"); err != nil {
@@ -334,23 +355,24 @@ func (f *clientFlow) readRaw() {
 			}
 			return
 		}
-		if a.String() != f.relay.String() || !Short(b[:n]) {
+		if !fromRelay || !Short(b[:n]) {
+			f.diagnostic.countOne(rawDropped)
 			continue
 		}
-		f.mu.Lock()
-		if f.disabled {
-			f.mu.Unlock()
+		if f.disabled.Load() {
 			continue
 		}
-		becameActive := !f.active
-		f.active = true
-		f.lastRaw = time.Now()
-		f.diagnostic.touch(f.lastRaw)
-		f.mu.Unlock()
+		now := time.Now()
+		becameActive := f.active.CompareAndSwap(false, true)
+		f.lastRaw.Store(now.UnixNano())
+		f.diagnostic.count(rawRxPackets, rawRxBytes, n)
+		f.diagnostic.touch(now)
 		if becameActive {
 			f.diagnostic.update("raw", f.relay.String(), "", false)
 		}
-		f.owner.deliver(result{p: append([]byte(nil), b[:n]...), a: net.UDPAddrFromAddrPort(f.target)})
+		p := pool.Get(n)
+		copy(p, b[:n])
+		f.owner.deliver(result{p: p, a: f.targetAddr, pooled: true})
 	}
 }
 func (c *PacketConn) writeFallback(p []byte, a net.Addr) (int, error) {
@@ -385,20 +407,26 @@ func (c *PacketConn) writeFallback(p []byte, a net.Addr) (int, error) {
 	return pc.WriteTo(p, a)
 }
 func (c *PacketConn) readFallback(pc net.PacketConn) {
-	b := make([]byte, 65536)
+	b := pool.Get(readBuffer)
+	defer pool.Put(b)
 	for {
 		n, a, e := pc.ReadFrom(b)
 		if e != nil {
 			c.deliver(result{err: e})
 			return
 		}
-		c.deliver(result{p: append([]byte(nil), b[:n]...), a: a})
+		p := pool.Get(n)
+		copy(p, b[:n])
+		c.deliver(result{p: p, a: a, pooled: true})
 	}
 }
 func (c *PacketConn) deliver(r result) {
 	select {
 	case c.reads <- r:
 	case <-c.closed:
+		if r.pooled {
+			pool.Put(r.p)
+		}
 	}
 }
 func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
@@ -431,7 +459,11 @@ func (c *PacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 		if timer != nil {
 			timer.Stop()
 		}
-		return copy(b, r.p), r.a, r.err
+		n := copy(b, r.p)
+		if r.pooled {
+			pool.Put(r.p)
+		}
+		return n, r.a, r.err
 	}
 }
 func (c *PacketConn) Close() error {
@@ -498,21 +530,18 @@ func (f *clientFlow) watch() {
 			return
 		case now := <-ticker.C:
 			f.writeMu.Lock()
-			f.mu.Lock()
 			reason := ""
-			if !f.disabled && f.active && now.Sub(f.lastRaw) >= rawSilence {
-				reason = "raw_silence"
-			} else if !f.disabled && !f.active && !f.probeEnd.IsZero() && !now.Before(f.probeEnd) {
-				reason = "probe_timeout"
+			if !f.disabled.Load() {
+				if f.active.Load() {
+					if last := f.lastRaw.Load(); last != 0 && now.UnixNano()-last >= int64(rawSilence) {
+						reason = "raw_silence"
+					}
+				} else if !f.probeEnd.IsZero() && !now.Before(f.probeEnd) {
+					reason = "probe_timeout"
+				}
 			}
-			expired := reason != ""
-			if expired {
-				f.disabled = true
-				f.active = false
-			}
-			f.mu.Unlock()
 			var err error
-			if expired {
+			if reason != "" {
 				err = f.disableLocked(true, reason)
 			}
 			if err == nil && now.Sub(lastKeep) >= 30*time.Second {

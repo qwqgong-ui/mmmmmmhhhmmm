@@ -10,6 +10,8 @@ import (
 	"net/netip"
 	"strconv"
 	"strings"
+
+	"github.com/metacubex/mihomo/common/pool"
 )
 
 const Address = "hybrid-quic.invalid:443"
@@ -37,7 +39,10 @@ func WriteFrame(w io.Writer, p []byte) error {
 	if len(p) > MaxPacket {
 		return errors.New("hybrid: oversized packet")
 	}
-	b := make([]byte, 2+len(p))
+	// The framed copy never outlives the write, so it comes from the pool
+	// rather than from a per-packet allocation.
+	b := pool.Get(2 + len(p))
+	defer pool.Put(b)
 	binary.BigEndian.PutUint16(b, uint16(len(p)))
 	copy(b[2:], p)
 	return WriteAll(w, b)

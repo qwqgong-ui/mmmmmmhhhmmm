@@ -43,6 +43,13 @@ The timeout also applies to idle raw flows. A 30-second stream keepalive protect
 against proxy idle timeouts; closing the packet connection closes all its streams
 and the terminal releases their targets/CIDs/raw bindings immediately.
 
+Where the platform allows it the raw socket is connected to the endpoint, so the
+kernel drops every other source and reports this path's ICMP errors. Those errors
+are counted, not acted on: the timeouts above stay the only reasons to fall back.
+`/hybrid-quic/flows` reports each flow's raw and stream packet and byte counts,
+the datagrams dropped as foreign, the ICMP reports, and whether its socket is
+connected.
+
 This wire protocol is `HQS1` and is incompatible with the removed `HQV3` HY2
 control protocol. Upgrade both sides and explicitly enable the option. There is
 no independent flow ID, registration retry, TTL-based flow cleanup or automatic
