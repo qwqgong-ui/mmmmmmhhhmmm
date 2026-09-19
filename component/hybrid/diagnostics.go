@@ -24,6 +24,7 @@ type FlowSnapshot struct {
 	ProbeCount   uint64   `json:"probeCount"`
 	RawRTTMillis float64  `json:"rawRttMs,omitempty"`
 	Reason       string   `json:"reason,omitempty"`
+	Permanent    bool     `json:"rawPermanent"`
 	Counters     Counters `json:"counters"`
 }
 
@@ -32,7 +33,9 @@ type FlowSnapshot struct {
 // long-header packets over the stream. Dropped and errors exist only on raw:
 // dropped counts datagrams from another source or without a short header, and
 // errors the ICMP messages a connected raw socket reports, none of which are
-// by themselves a reason to fall back.
+// by themselves a reason to fall back. Fallbacks counts every return to the
+// stream and activations every arrival on raw, so a flow that keeps recovering
+// is visible as activations beyond the first.
 type Counters struct {
 	RawTxPackets    uint64 `json:"rawTxPackets"`
 	RawRxPackets    uint64 `json:"rawRxPackets"`
@@ -44,6 +47,8 @@ type Counters struct {
 	StreamRxBytes   uint64 `json:"streamRxBytes"`
 	RawDropped      uint64 `json:"rawDropped"`
 	RawErrors       uint64 `json:"rawErrors"`
+	RawFallbacks    uint64 `json:"rawFallbacks"`
+	RawActivations  uint64 `json:"rawActivations"`
 }
 
 func (c *Counters) add(o Counters) {
@@ -57,6 +62,8 @@ func (c *Counters) add(o Counters) {
 	c.StreamRxBytes += o.StreamRxBytes
 	c.RawDropped += o.RawDropped
 	c.RawErrors += o.RawErrors
+	c.RawFallbacks += o.RawFallbacks
+	c.RawActivations += o.RawActivations
 }
 
 // Counters are indexed so that the per-packet path is a single atomic add and
@@ -74,6 +81,8 @@ const (
 	streamRxBytes
 	rawDropped
 	rawErrors
+	rawFallbacks
+	rawActivations
 	counterCount
 )
 
@@ -97,6 +106,8 @@ func (c *counters) snapshot() Counters {
 		StreamRxBytes:   c[streamRxBytes].Load(),
 		RawDropped:      c[rawDropped].Load(),
 		RawErrors:       c[rawErrors].Load(),
+		RawFallbacks:    c[rawFallbacks].Load(),
+		RawActivations:  c[rawActivations].Load(),
 	}
 }
 
@@ -119,6 +130,7 @@ type flowDiagnostic struct {
 	mu sync.Mutex
 	FlowSnapshot
 	closed       bool
+	reachedRaw   bool
 	firstProbe   time.Time
 	lastActivity atomic.Int64
 	counters     counters
@@ -160,13 +172,15 @@ func (d *flowDiagnostic) setRawConnected(connected bool) {
 	d.mu.Unlock()
 }
 
-// Called only at transitions/probes, never on steady-state raw packets.
-// Permanent fallback is latched: peer acknowledgements and late callbacks
-// cannot change its reason, count twice, or resurrect a closed flow.
-func (d *flowDiagnostic) update(state, endpoint, reason string, probe bool) {
+// Called only at transitions, probes and fallbacks, never on steady-state raw
+// packets. A permanent fallback is latched: peer acknowledgements and late
+// callbacks cannot change its reason, count twice, or resurrect the flow. A
+// recoverable fallback records its reason and leaves the flow free to probe
+// its way back to raw, which clears the reason again.
+func (d *flowDiagnostic) update(state, endpoint, reason string, probe, permanent bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	if d.closed || d.Reason != "" {
+	if d.closed || d.Permanent {
 		return
 	}
 	if endpoint != "" {
@@ -184,7 +198,10 @@ func (d *flowDiagnostic) update(state, endpoint, reason string, probe bool) {
 	if state == "probing" && old == "raw" {
 		state = "raw"
 	}
-	if state == "raw" && old != "raw" {
+	firstRaw := state == "raw" && !d.reachedRaw
+	if firstRaw {
+		// Only the first arrival on raw is a success; the rest are recoveries.
+		d.reachedRaw = true
 		rawSuccesses.Add(1)
 		if !d.firstProbe.IsZero() {
 			d.RawRTTMillis = float64(now.Sub(d.firstProbe)) / float64(time.Millisecond)
@@ -192,16 +209,26 @@ func (d *flowDiagnostic) update(state, endpoint, reason string, probe bool) {
 	}
 	if reason != "" {
 		d.Reason = reason
+		d.Permanent = permanent
 		diagnostics.Lock()
 		diagnostics.fallbacks[reason]++
 		diagnostics.Unlock()
+	} else if state == "raw" {
+		d.Reason = ""
 	}
 	if state != "" {
 		d.State = state
 	}
-	if (old != d.State && old != "registering") || reason != "" {
+	// Recoverable fallbacks and the probes that undo them repeat for the life
+	// of an idle flow, so only the first activation and a permanent fallback
+	// are worth an INFO line.
+	level := log.DEBUG
+	if firstRaw || (reason != "" && permanent) {
+		level = log.INFO
+	}
+	if ((old != d.State && old != "registering") || reason != "") && log.Enabled(level) {
 		host, _, _ := net.SplitHostPort(d.Target)
-		log.Fields(log.INFO, map[string]string{"subsystem": "hybrid", "event": "state_transition", "flow_id": d.FlowID, "host": host, "proxy": d.Proxy, "network_scope": d.NetworkScope, "reason": reason, "from": old, "to": d.State}, "Hybrid QUIC %s: %s -> %s (%s)", d.FlowID, old, d.State, reason)
+		log.Fields(level, map[string]string{"subsystem": "hybrid", "event": "state_transition", "flow_id": d.FlowID, "host": host, "proxy": d.Proxy, "network_scope": d.NetworkScope, "reason": reason, "from": old, "to": d.State}, "Hybrid QUIC %s: %s -> %s (%s)", d.FlowID, old, d.State, reason)
 	}
 	if probe && log.Enabled(log.DEBUG) {
 		log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "raw_probe", "flow_id": d.FlowID}, "Hybrid QUIC %s: raw probe #%d endpoint=%s", d.FlowID, d.ProbeCount, d.RawEndpoint)

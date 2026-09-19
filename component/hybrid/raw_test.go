@@ -209,3 +209,203 @@ func TestStreamFrameDoesNotAllocatePerPacket(t *testing.T) {
 		t.Fatalf("%v allocations per framed packet", n)
 	}
 }
+
+// flowHarness drives one flow's send path without a registration handshake and
+// records the frames it puts on the stream. relay stands in for the terminal's
+// raw endpoint.
+type flowHarness struct {
+	flow   *clientFlow
+	relay  net.PacketConn
+	frames chan []byte
+}
+
+func newFlowHarness(t *testing.T) *flowHarness {
+	t.Helper()
+	relay, pc := localUDP(t), localUDP(t)
+	peer, stream := net.Pipe()
+	d := newFlowDiagnostic("flow.test:443", "", "")
+	f := &clientFlow{
+		owner:      NewPacketConn(ClientOptions{}),
+		stream:     stream,
+		raw:        newRawSocket(pc, netip.MustParseAddrPort(relay.LocalAddr().String())),
+		targetAddr: &net.UDPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 443},
+		diagnostic: d,
+		done:       make(chan struct{}),
+	}
+	h := &flowHarness{flow: f, relay: relay, frames: make(chan []byte, 64)}
+	go func() {
+		for {
+			p, err := ReadFrame(peer)
+			if err != nil {
+				return
+			}
+			if p != nil { // a keepalive carries no frame
+				h.frames <- p
+			}
+		}
+	}()
+	t.Cleanup(func() {
+		close(f.done)
+		f.owner.Close()
+		stream.Close()
+		peer.Close()
+		d.close()
+	})
+	return h
+}
+
+// frame returns the next frame the flow put on the stream; an empty one is the
+// pause that tells the terminal to stop sending raw.
+func (h *flowHarness) frame(t *testing.T) []byte {
+	t.Helper()
+	select {
+	case p := <-h.frames:
+		return p
+	case <-time.After(time.Second):
+		t.Fatal("no frame reached the stream")
+		return nil
+	}
+}
+
+func (h *flowHarness) expectRaw(t *testing.T, want []byte) {
+	t.Helper()
+	b := make([]byte, 64)
+	h.relay.SetReadDeadline(time.Now().Add(time.Second))
+	n, _, err := h.relay.ReadFrom(b)
+	if err != nil || string(b[:n]) != string(want) {
+		t.Fatalf("relay received %q: %v", b[:n], err)
+	}
+}
+
+func (h *flowHarness) expectNoRaw(t *testing.T) {
+	t.Helper()
+	b := make([]byte, 64)
+	h.relay.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	if n, _, err := h.relay.ReadFrom(b); err == nil {
+		t.Fatalf("the flow probed raw when it should not have: %q", b[:n])
+	}
+}
+
+func (h *flowHarness) state(t *testing.T) (retries int, retryAt time.Time, reason string, permanent bool) {
+	t.Helper()
+	h.flow.writeMu.Lock()
+	retries, retryAt = h.flow.retries, h.flow.retryAt
+	h.flow.writeMu.Unlock()
+	d := h.flow.diagnostic
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return retries, retryAt, d.Reason, d.Permanent
+}
+
+var shortPacket = []byte{0x40, 1, 2, 3}
+
+func TestIdleSilenceCostsNothingAndProbesAgain(t *testing.T) {
+	h := newFlowHarness(t)
+	f := h.flow
+	idle := time.Now().Add(-2 * rawSilence)
+	f.active.Store(true)
+	f.lastRaw.Store(idle.UnixNano())
+	f.diagnostic.touch(idle) // the flow carried nothing while raw went quiet
+
+	if _, err := f.write(shortPacket); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if p := h.frame(t); len(p) == 0 {
+		t.Fatal("an idle flow told the terminal to stop sending raw")
+	}
+	retries, retryAt, reason, permanent := h.state(t)
+	if retries != 0 || !retryAt.IsZero() || reason != "raw_idle" || permanent {
+		t.Fatalf("idle silence charged an attempt: retries=%d retryAt=%v reason=%q permanent=%v", retries, retryAt, reason, permanent)
+	}
+
+	// With nothing charged there is nothing to wait for: the next packet
+	// probes raw again while it travels the stream.
+	if _, err := f.write(shortPacket); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h.frame(t)
+	h.expectRaw(t, shortPacket)
+}
+
+func TestBusySilenceStopsTheTerminalAndBacksOff(t *testing.T) {
+	h := newFlowHarness(t)
+	f := h.flow
+	f.active.Store(true)
+	f.lastRaw.Store(time.Now().Add(-2 * rawSilence).UnixNano())
+	f.diagnostic.touch(time.Now()) // traffic was flowing, so raw really broke
+
+	start := time.Now()
+	if _, err := f.write(shortPacket); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	if p := h.frame(t); len(p) != 0 {
+		t.Fatalf("the terminal was not told to stop sending raw: %q", p)
+	}
+	h.frame(t) // the packet itself, on the stream
+	retries, retryAt, reason, permanent := h.state(t)
+	if retries != 1 || retryAt.Sub(start) < rawRetryBase || reason != "raw_silence" || permanent {
+		t.Fatalf("retries=%d retryAt=+%v reason=%q permanent=%v", retries, retryAt.Sub(start), reason, permanent)
+	}
+
+	// Nothing probes again before the backoff expires.
+	if _, err := f.write(shortPacket); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h.frame(t)
+	h.expectNoRaw(t)
+}
+
+func TestRepeatedFailuresGiveRawUpForGood(t *testing.T) {
+	h := newFlowHarness(t)
+	f := h.flow
+	for i := range rawRetryLimit + 1 {
+		f.writeMu.Lock()
+		// Arrive at a probe window that has already run out.
+		f.retryAt = time.Time{}
+		f.probeEnd = time.Now().Add(-time.Second)
+		f.writeMu.Unlock()
+		if _, err := f.write(shortPacket); err != nil {
+			t.Fatalf("write %d: %v", i, err)
+		}
+		h.frame(t) // the pause
+		h.frame(t) // the packet
+		if retries, _, _, _ := h.state(t); f.disabled.Load() != (retries > rawRetryLimit) {
+			t.Fatalf("attempt %d: disabled=%v retries=%d", i, f.disabled.Load(), retries)
+		}
+	}
+	if !f.disabled.Load() {
+		t.Fatal("raw was never given up")
+	}
+	if _, _, reason, permanent := h.state(t); reason != "probe_timeout" || !permanent {
+		t.Fatalf("reason=%q permanent=%v", reason, permanent)
+	}
+}
+
+func TestLateRawPacketRecoversTheFlow(t *testing.T) {
+	h := newFlowHarness(t)
+	f := h.flow
+	go f.readRaw()
+	// A flow waiting out a backoff, with no probe due for a long time.
+	f.writeMu.Lock()
+	f.retries, f.retryAt = 1, time.Now().Add(time.Hour)
+	f.writeMu.Unlock()
+
+	if _, err := h.relay.WriteTo(shortPacket, h.flow.raw.pc.LocalAddr()); err != nil {
+		t.Fatalf("relay write: %v", err)
+	}
+	for deadline := time.Now().Add(time.Second); !f.active.Load(); {
+		if time.Now().After(deadline) {
+			t.Fatal("a raw packet from the terminal did not revive the flow")
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	// Raw carries the next packet again, without waiting out the backoff.
+	if _, err := f.write(shortPacket); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	h.expectRaw(t, shortPacket)
+	if c := f.diagnostic.counters.snapshot(); c.RawActivations != 1 || c.RawTxPackets != 1 {
+		t.Fatalf("counters %+v", c)
+	}
+}

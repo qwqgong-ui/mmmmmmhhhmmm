@@ -9,22 +9,47 @@ import (
 	"time"
 )
 
-func TestDiagnosticFallbackIsPermanentAndCountedOnce(t *testing.T) {
+func TestDiagnosticRecoverableFallbackDoesNotLatch(t *testing.T) {
+	before := Stats()
+	d := newFlowDiagnostic("recover.test:443", "node", "scope")
+	defer d.close()
+	d.update("tunnel", "203.0.113.1:443", "", false, false)
+	d.update("probing", "", "", true, false)
+	d.update("raw", "", "", false, false)
+
+	// A recoverable fallback names its reason and leaves the flow free to
+	// probe its way back, which clears the reason again.
+	d.update("tunnel", "", "raw_idle", false, false)
+	got := FlowSnapshotsFor("recover.test", "443", "node")
+	if len(got) != 1 || got[0].State != "tunnel" || got[0].Reason != "raw_idle" || got[0].Permanent {
+		t.Fatalf("flows=%+v", got)
+	}
+	d.update("probing", "", "", true, false)
+	d.update("raw", "", "", false, false)
+	if got = FlowSnapshotsFor("recover.test", "443", "node"); len(got) != 1 || got[0].State != "raw" || got[0].Reason != "" {
+		t.Fatalf("flow did not recover: %+v", got)
+	}
+	if after := Stats(); after.RawSuccesses != before.RawSuccesses+1 {
+		t.Fatalf("a recovery counted as a second success: %d -> %d", before.RawSuccesses, after.RawSuccesses)
+	}
+}
+
+func TestDiagnosticPermanentFallbackIsLatchedAndCountedOnce(t *testing.T) {
 	before := Stats()
 	d := newFlowDiagnostic("diag.test:443", "node", "scope")
 	defer d.close()
-	d.update("tunnel", "203.0.113.1:443", "", false)
-	d.update("probing", "", "", true)
-	d.update("raw", "", "", false)
-	d.update("probing", "", "", true)
+	d.update("tunnel", "203.0.113.1:443", "", false, false)
+	d.update("probing", "", "", true, false)
+	d.update("raw", "", "", false, false)
+	d.update("probing", "", "", true, false)
 	if got := FlowSnapshotsFor("diag.test", "443", "node"); len(got) != 1 || got[0].State != "raw" {
 		t.Fatalf("flows=%+v", got)
 	}
-	d.update("tunnel", "", "probe_timeout", false)
-	d.update("tunnel", "", "peer_disabled_raw", false)
-	d.update("raw", "", "", false)
+	d.update("tunnel", "", "probe_timeout", false, true)
+	d.update("tunnel", "", "peer_disabled_raw", false, true)
+	d.update("raw", "", "", false, false)
 	got := FlowSnapshotsFor("diag.test", "443", "node")
-	if len(got) != 1 || got[0].State != "tunnel" || got[0].Reason != "probe_timeout" {
+	if len(got) != 1 || got[0].State != "tunnel" || got[0].Reason != "probe_timeout" || !got[0].Permanent {
 		t.Fatalf("flows=%+v", got)
 	}
 	after := Stats()
@@ -32,7 +57,7 @@ func TestDiagnosticFallbackIsPermanentAndCountedOnce(t *testing.T) {
 		t.Fatalf("counts=%+v before=%+v", after, before)
 	}
 	d.close()
-	d.update("raw", "", "socket_read_error", false)
+	d.update("raw", "", "socket_read_error", false, false)
 	if got := FlowSnapshotsFor("diag.test", "", ""); len(got) != 0 {
 		t.Fatalf("closed flow resurrected: %+v", got)
 	}
@@ -53,7 +78,7 @@ func TestDiagnosticActivityAndConcurrentClose(t *testing.T) {
 		wg.Go(func() {
 			for range 100 {
 				d.touch(time.Now())
-				d.update("probing", "", "", true)
+				d.update("probing", "", "", true, false)
 				FlowSnapshots()
 			}
 		})
@@ -92,7 +117,7 @@ func TestDiagnosticStreamCloseRemoved(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("reader did not close")
 	}
-	d.update("tunnel", "", "socket_read_error", false)
+	d.update("tunnel", "", "socket_read_error", false, true)
 	if got := FlowSnapshotsFor("closed.test", "", ""); len(got) != 0 {
 		t.Fatal(got)
 	}

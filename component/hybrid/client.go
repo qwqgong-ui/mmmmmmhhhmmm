@@ -19,6 +19,13 @@ const probeInterval = 250 * time.Millisecond
 const probeTimeout = 3 * time.Second
 const rawSilence = 15 * time.Second
 
+// A flow that lost raw to plain idleness probes again on its next packet. One
+// that lost it while it had traffic waits, doubling after every attempt, and
+// after rawRetryLimit attempts stays on the stream for good.
+const rawRetryBase = 30 * time.Second
+const rawRetryMax = 10 * time.Minute
+const rawRetryLimit = 8
+
 // readBuffer holds one datagram while it is copied into a pooled buffer sized
 // to the datagram, so a 64 KiB receive buffer is allocated per flow and never
 // per packet.
@@ -63,7 +70,8 @@ type clientFlow struct {
 	disabled, active    atomic.Bool
 	lastRaw             atomic.Int64 // last raw reply, unix nanoseconds; zero until the first
 	probeEnd, nextProbe time.Time    // protected by writeMu
-	disableNotified     bool         // protected by writeMu
+	retryAt             time.Time    // earliest next probe cycle, protected by writeMu
+	retries             int          // recoverable fallbacks charged so far, protected by writeMu
 	done                chan struct{}
 	diagnostic          *flowDiagnostic
 }
@@ -135,14 +143,14 @@ func (f *clientFlow) open(address string) {
 	stream, err := c.opts.Dial(ctx)
 	if err != nil {
 		f.err = err
-		f.diagnostic.update("fallback", "", "stream_dial_error", false)
+		f.diagnostic.update("fallback", "", "stream_dial_error", false, true)
 		f.diagnostic.close()
 		close(f.ready)
 		return
 	}
 	stop := context.AfterFunc(ctx, func() { stream.Close() })
 	fail := func(err error) {
-		f.diagnostic.update("fallback", "", "registration_error", false)
+		f.diagnostic.update("fallback", "", "registration_error", false, true)
 		f.diagnostic.close()
 		stop()
 		stream.Close()
@@ -212,7 +220,7 @@ func (f *clientFlow) open(address string) {
 	stream.SetWriteDeadline(c.writeDeadline)
 	c.mu.Unlock()
 	f.diagnostic.setRawConnected(f.raw != nil && f.raw.connected())
-	f.diagnostic.update("tunnel", f.relay.String(), "", false)
+	f.diagnostic.update("tunnel", f.relay.String(), "", false, false)
 	if log.Enabled(log.DEBUG) {
 		log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "hqs1_registered", "flow_id": f.diagnostic.FlowID, "host": address}, "HQS1 registered target=%s raw_endpoint=%s", f.target, f.relay)
 	}
@@ -231,49 +239,81 @@ func (f *clientFlow) disable(notify bool, reason string) error {
 	return f.disableLocked(notify, reason)
 }
 
+// disableLocked gives raw up for the life of the flow. Notifying stops the
+// terminal from sending raw too; it keeps the flow's binding, which only the
+// client's own raw packets can ever use again, and none follow.
 func (f *clientFlow) disableLocked(notify bool, reason string) error {
 	f.disabled.Store(true)
 	f.active.Store(false)
-	f.diagnostic.update("tunnel", "", reason, false)
-	// A permanent fallback sends at most one disable frame, including setup
-	// failure. A peer acknowledgement must not overwrite the original reason.
-	if f.disableNotified {
-		return nil
-	}
-	f.disableNotified = true
+	f.diagnostic.countOne(rawFallbacks)
+	f.diagnostic.update("tunnel", "", reason, false, true)
 	if notify {
 		return WriteFrame(f.stream, nil)
 	}
 	return nil
 }
+
+// fallbackLocked returns the flow to the stream without giving raw up. Silence
+// while the flow had nothing to carry only means raw went idle: nothing was
+// lost, the terminal still holds the binding, and the next packet probes again
+// at no charge. Anything else tells the terminal to stop sending raw, waits
+// longer after each attempt, and finally gives up for good.
+func (f *clientFlow) fallbackLocked(now time.Time, reason string) error {
+	f.active.Store(false)
+	f.lastRaw.Store(0)
+	f.probeEnd, f.nextProbe = time.Time{}, time.Time{}
+	if reason == "raw_silence" && f.idleFor(now) >= rawSilence {
+		f.retryAt = time.Time{}
+		f.diagnostic.countOne(rawFallbacks)
+		f.diagnostic.update("tunnel", "", "raw_idle", false, false)
+		return nil
+	}
+	f.retries++
+	if f.retries > rawRetryLimit {
+		return f.disableLocked(true, reason)
+	}
+	f.retryAt = now.Add(min(rawRetryBase<<(f.retries-1), rawRetryMax))
+	f.diagnostic.countOne(rawFallbacks)
+	f.diagnostic.update("tunnel", "", reason, false, false)
+	return WriteFrame(f.stream, nil)
+}
+
+// idleFor reports how long the flow has carried no application packet in
+// either direction. write records the packet it is handling only after it has
+// decided, so this is the gap before the current one.
+func (f *clientFlow) idleFor(now time.Time) time.Duration {
+	last := f.diagnostic.lastActivity.Load()
+	if last == 0 {
+		return 0
+	}
+	return time.Duration(now.UnixNano() - last)
+}
 func (f *clientFlow) write(p []byte) (int, error) {
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
 	now := time.Now()
-	reason := ""
 	raw, probe := false, false
 	if !f.disabled.Load() && Short(p) {
 		if f.active.Load() {
 			if last := f.lastRaw.Load(); last != 0 && now.UnixNano()-last >= int64(rawSilence) {
-				reason = "raw_silence"
+				if err := f.fallbackLocked(now, "raw_silence"); err != nil {
+					return 0, err
+				}
 			} else {
 				raw = true
 			}
-		} else {
+		} else if !now.Before(f.retryAt) {
 			if f.probeEnd.IsZero() {
 				f.probeEnd = now.Add(probeTimeout)
 			}
 			if !now.Before(f.probeEnd) {
-				reason = "probe_timeout"
+				if err := f.fallbackLocked(now, "probe_timeout"); err != nil {
+					return 0, err
+				}
 			} else if !now.Before(f.nextProbe) {
 				probe = true
 				f.nextProbe = now.Add(probeInterval)
 			}
-		}
-	}
-	if reason != "" {
-		if err := f.disableLocked(true, reason); err != nil {
-			return 0, err
 		}
 	}
 	if raw {
@@ -292,7 +332,7 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	f.diagnostic.count(streamTxPackets, streamTxBytes, len(p))
 	f.diagnostic.touch(now)
 	if probe {
-		f.diagnostic.update("probing", f.relay.String(), "", true)
+		f.diagnostic.update("probing", f.relay.String(), "", true, false)
 		if _, err := f.raw.write(p); err != nil {
 			if err = f.disableLocked(true, "probe_write_error"); err != nil {
 				return 0, err
@@ -368,7 +408,8 @@ func (f *clientFlow) readRaw() {
 		f.diagnostic.count(rawRxPackets, rawRxBytes, n)
 		f.diagnostic.touch(now)
 		if becameActive {
-			f.diagnostic.update("raw", f.relay.String(), "", false)
+			f.diagnostic.countOne(rawActivations)
+			f.diagnostic.update("raw", f.relay.String(), "", false, false)
 		}
 		p := pool.Get(n)
 		copy(p, b[:n])
@@ -530,19 +571,15 @@ func (f *clientFlow) watch() {
 			return
 		case now := <-ticker.C:
 			f.writeMu.Lock()
-			reason := ""
+			var err error
 			if !f.disabled.Load() {
 				if f.active.Load() {
 					if last := f.lastRaw.Load(); last != 0 && now.UnixNano()-last >= int64(rawSilence) {
-						reason = "raw_silence"
+						err = f.fallbackLocked(now, "raw_silence")
 					}
 				} else if !f.probeEnd.IsZero() && !now.Before(f.probeEnd) {
-					reason = "probe_timeout"
+					err = f.fallbackLocked(now, "probe_timeout")
 				}
-			}
-			var err error
-			if reason != "" {
-				err = f.disableLocked(true, reason)
 			}
 			if err == nil && now.Sub(lastKeep) >= 30*time.Second {
 				err = WriteKeepAlive(f.stream)

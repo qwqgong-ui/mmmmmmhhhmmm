@@ -2,13 +2,13 @@
 
 [返回功能目录](../features.md) · [专题](../hybrid-quic.md)
 
-raw 路径只搬运内层 QUIC 的短包头数据报，收发在每个包上重复同样的工作。本次只改这条路径的开销和可观测性，不动它的状态机：探测超时、raw socket 失败和 15 秒静默仍是永久回退的唯一原因，raw 仍不会自动恢复。
+raw 路径只搬运内层 QUIC 的短包头数据报，收发在每个包上重复同样的工作。本页只讲这条路径的开销和可观测性；回退后的恢复见[raw 路径的恢复与重新探测](hybrid-quic-raw-recovery.md)。
 
 ## socket 连接化
 
 raw socket 仍按节点原有的 interface/routing-mark 选项监听，之后 connect 到终端返回的 relay。内核因此把路由留在 socket 上而不必逐包查找，在包进入接收循环前丢掉其他来源，并回报这条路径的 ICMP 差错；发送不再附目的地址，接收不再比较来源。connect 失败的平台保留原来的未连接 socket，改为按 addr:port 比较来源，不再格式化成字符串。
 
-ICMP 差错只计数，不作为回退依据：未连接 socket 原本看不到它们，把它们当作 socket 失效会让 raw 在本可继续工作时提前放弃。
+ICMP 差错只计数，不作为回退依据：未连接 socket 原本看不到它们，把它们当作 socket 失效会让 raw 在本可继续工作时提前放弃；判断回退仍然只看探测超时和静默。
 
 收发缓冲区各请求 1 MiB，由内核上限（Linux 的 `net.core.rmem_max`）裁剪，设不上去时维持系统默认。
 

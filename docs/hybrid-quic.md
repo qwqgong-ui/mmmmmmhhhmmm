@@ -36,12 +36,17 @@ Only public UDP 443 targets beginning with a QUIC Initial use hybrid. Other UDP
 uses the node's native datagram support. Fake-IP names stay names until the
 terminal resolves them. DNS mapping/hosts mode retains a selected real IP.
 
-A successful raw reply activates raw. Probe timeout, raw socket failure, or
-15 seconds without a raw reply permanently returns both directions to the
-stream. Late raw packets cannot reactivate it, even after the network recovers.
-The timeout also applies to idle raw flows. A 30-second stream keepalive protects
-against proxy idle timeouts; closing the packet connection closes all its streams
-and the terminal releases their targets/CIDs/raw bindings immediately.
+A successful raw reply activates raw. A probe timeout, or 15 seconds without a
+raw reply, returns both directions to the stream; the timeout also applies to
+idle raw flows. That is not the end of raw. A flow that was carrying nothing
+when raw went quiet keeps its binding and probes again on its next packet; one
+that was busy tells the terminal to stop sending raw, then probes again after 30
+seconds, doubling to at most 10 minutes and giving raw up after eight attempts.
+A raw packet arriving in the meantime resumes the flow with no probe at all.
+A raw socket failure on either side is still permanent. A 30-second stream
+keepalive protects against proxy idle timeouts; closing the packet connection
+closes all its streams and the terminal releases their targets/CIDs/raw bindings
+immediately.
 
 Where the platform allows it the raw socket is connected to the endpoint, so the
 kernel drops every other source and reports this path's ICMP errors. Those errors

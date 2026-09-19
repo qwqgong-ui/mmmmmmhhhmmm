@@ -9,7 +9,7 @@ External controller 提供以下诊断接口；配置 `secret` 时均要求 Bear
 - `GET /dns/server-capabilities`：server-dns 与 domain-bundle 分别记录 supported/unsupported/expired、最近探测时间；未列出的节点是 unknown，不等于支持。
 - `GET /direct/winners[?host=]`：TCP winner/RTT/scope，以及经 QUIC server CID + 1-RTT 确认的 UDP/QUIC warm winner。
 - `GET /hybrid-quic/stats`：当前 registering/tunnel/probing/raw 数量与生命周期累计值。successRate = 曾进入 raw 的 flow 数 / 已开始的 flow 数；fallback 原因每个 flow 只计第一次，关闭后不保留活动记录。`counters` 是活动 flow 与已关闭 flow 计数之和。
-- `GET /hybrid-quic/flows[?host=&port=&proxy=]`：活动 flow 的状态、目标、raw endpoint、raw socket 是否已连接、应用数据 idle 时间、probe 次数和首次 fallback 原因。keepalive 不刷新应用 idle。`counters` 分 raw 与 stream 两条路径统计收发包数和字节数，另有来源不符而丢弃的数据报数和 raw socket 收到的 ICMP 差错数；短包头的包号是加密的，客户端无法据此统计 raw 的丢包或乱序。
+- `GET /hybrid-quic/flows[?host=&port=&proxy=]`：活动 flow 的状态、目标、raw endpoint、raw socket 是否已连接、应用数据 idle 时间、probe 次数和最近一次 fallback 原因（回到 raw 时清空，`rawPermanent` 表示是否还能恢复）。keepalive 不刷新应用 idle。`counters` 分 raw 与 stream 两条路径统计收发包数和字节数，另有来源不符而丢弃的数据报数、raw socket 收到的 ICMP 差错数、回到可靠流的次数和进入 raw 的次数（超过 1 即为恢复）；短包头的包号是加密的，客户端无法据此统计 raw 的丢包或乱序。
 - `GET /stats/downstream`：已接入的 DNS、DIRECT TCP、ICMP 报告、进程归属累计计数，另含 Hybrid 计数和慢日志订阅者丢弃数。计数随进程重启归零，不代表所有下游功能均已埋点。
 - `GET /debug/path?host=example.com&port=443&network=tcp`：默认不发起 DNS 或目标连接，汇总规则预览、缓存来源、ECS、真实候选、缓存中的 HTTPS/SVCB/ECH 摘要、winner 与该目标的 Hybrid 活动状态。
 
