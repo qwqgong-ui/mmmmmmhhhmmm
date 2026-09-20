@@ -44,6 +44,23 @@ func updateTTL(records []D.RR, ttl uint32) {
 	}
 }
 
+// negativeCacheTTL is the floor, in seconds, applied to a response that
+// carries no usable records.
+//
+// minimalTTL returns 0 for such a response: an empty NOERROR has no Answer to
+// take a TTL from, and upstreams that answer without an authority section
+// leave no SOA either. A zero TTL makes the entry stale the moment it is
+// stored, so every subsequent lookup takes ExchangeContext's stale branch and
+// fires another refresh. For a destination an application retries in a tight
+// loop - e.g. an IPv6-only STUN host that has no A record, re-sent on every
+// UDP retry - that turns a cache hit into an upstream query tens of times per
+// second, which is precisely what the cache exists to prevent.
+//
+// RFC 2308 negative caching normally derives this from the authority SOA;
+// where minimalTTL already found one, its value is larger than this floor and
+// is kept. The floor only covers responses that carry nothing at all.
+const negativeCacheTTL uint32 = 30
+
 func prepareCachedMessage(q D.Question, msg *D.Msg) (*D.Msg, time.Time) {
 	// skip dns cache for acme challenge
 	if q.Qtype == D.TypeTXT && strings.HasPrefix(q.Name, "_acme-challenge.") {
@@ -59,6 +76,12 @@ func prepareCachedMessage(q D.Question, msg *D.Msg) (*D.Msg, time.Time) {
 	})
 
 	ttl := minimalTTL(lo.Concat(msg.Answer, msg.Ns, msg.Extra))
+	// An answered record with TTL 0 is a deliberate "do not cache" from the
+	// upstream and is left alone; only a response with nothing to answer gets
+	// the negative floor.
+	if len(msg.Answer) == 0 && ttl < negativeCacheTTL {
+		ttl = negativeCacheTTL
+	}
 	return msg, time.Now().Add(time.Duration(ttl) * time.Second)
 }
 

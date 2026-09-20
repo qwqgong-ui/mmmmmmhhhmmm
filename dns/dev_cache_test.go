@@ -146,3 +146,30 @@ func TestZeroTTLSuccessIsStillAReplacement(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "192.0.2.2", stored.Answer[0].(*D.A).A.String())
 }
+
+// TestPrepareCachedMessageFloorsNegativeAnswers pins the negative-cache floor.
+// An empty NOERROR has no record to take a TTL from, so minimalTTL returns 0
+// and the entry lands in the cache already stale -- every later lookup then
+// takes the stale branch and fires a fresh upstream refresh. That turned one
+// retried destination into tens of upstream queries per second.
+func TestPrepareCachedMessageFloorsNegativeAnswers(t *testing.T) {
+	q := D.Question{Name: "stun6.chat.bilibili.com.", Qtype: D.TypeA, Qclass: D.ClassINET}
+	empty := &D.Msg{}
+	empty.SetQuestion(q.Name, q.Qtype)
+	empty.Rcode = D.RcodeSuccess
+
+	_, due := prepareCachedMessage(q, empty)
+	if remaining := time.Until(due); remaining < time.Duration(negativeCacheTTL-5)*time.Second {
+		t.Fatalf("empty answer cached for %v, want at least ~%ds", remaining, negativeCacheTTL)
+	}
+
+	// A real answer keeps its own TTL, including an upstream's deliberate 0.
+	answered := empty.Copy()
+	answered.Answer = []D.RR{&D.A{
+		Hdr: D.RR_Header{Name: q.Name, Rrtype: D.TypeA, Class: D.ClassINET, Ttl: 0},
+		A:   net.IPv4(1, 2, 3, 4),
+	}}
+	if _, due := prepareCachedMessage(q, answered); time.Until(due) > 5*time.Second {
+		t.Fatal("answered record with TTL 0 was given the negative floor, want it respected")
+	}
+}
