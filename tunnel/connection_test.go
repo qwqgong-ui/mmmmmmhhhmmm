@@ -280,3 +280,31 @@ func TestPacketSenderRestoresResolvedAndIPv6Targets(t *testing.T) {
 		}
 	})
 }
+
+// TestUDPResolveFailureLogThrottle pins the behaviour that motivated the
+// throttle: a destination that keeps failing must warn once, not once per
+// retry. Without it a single black-holed FQDN produced tens of thousands of
+// warn lines per hour and evicted the rest of the journal.
+func TestUDPResolveFailureLogThrottle(t *testing.T) {
+	t.Cleanup(func() {
+		udpResolveFailureLog.Clear()
+	})
+	udpResolveFailureLog.Clear()
+
+	const host = "stun6.example.invalid"
+
+	if _, seen := udpResolveFailureLog.GetOrStore(host, func() struct{} { return struct{}{} }); seen {
+		t.Fatal("first failure for a host reported as already seen, want a warn")
+	}
+	for i := range 100 {
+		if _, seen := udpResolveFailureLog.GetOrStore(host, func() struct{} { return struct{}{} }); !seen {
+			t.Fatalf("retry %d reported as unseen, want suppression inside the window", i)
+		}
+	}
+
+	// A different destination is throttled independently, so one noisy peer
+	// cannot hide another host's first failure.
+	if _, seen := udpResolveFailureLog.GetOrStore("other.example.invalid", func() struct{} { return struct{}{} }); seen {
+		t.Fatal("unrelated host reported as already seen, want its own warn")
+	}
+}

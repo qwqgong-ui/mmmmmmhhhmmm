@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/metacubex/mihomo/common/lru"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/diagstats"
 	C "github.com/metacubex/mihomo/constant"
@@ -31,6 +32,42 @@ type remoteDomainTarget struct {
 // out to many trackers or DHT nodes; the cap keeps that bounded without
 // reintroducing the old "learn exactly one IP" restriction.
 const maxLearnedTargets = 512
+
+// udpResolveFailureLogWindow bounds, in seconds, how often one unresolvable
+// UDP destination may repeat its failure at warn level.
+//
+// A destination that cannot be resolved is not resolved once: the application
+// never learns that the FQDN is a dead end (fake-ip already answered its
+// query), so it simply retries, and every retry re-runs the lookup and logs
+// again. One such peer - e.g. an IPv6-only STUN host while the system has no
+// usable IPv6, whose A lookup finds nothing and whose AAAA lookup is refused -
+// is enough to produce tens of thousands of journal entries per hour and
+// evict everything else from a size-capped journal.
+//
+// An unresolvable destination is a property of the network the user is on,
+// not a fault in the proxy, so it is reported at info rather than warn; one
+// line per host per window keeps it discoverable when the log level is raised
+// to look for it, and the repeats stay available at debug.
+const udpResolveFailureLogWindow = 60
+
+// udpResolveFailureLog remembers which destinations have already warned inside
+// the current window. Entries expire on their own (the cache is not created
+// with WithUpdateAgeOnGet, so reads do not extend the window) and the size cap
+// bounds it if many distinct hosts fail at once.
+var udpResolveFailureLog = lru.New(
+	lru.WithAge[string, struct{}](udpResolveFailureLogWindow),
+	lru.WithSize[string, struct{}](512),
+)
+
+// logUDPResolveFailure reports the first failure recorded for a host in the
+// current window at info and demotes the rest to debug.
+func logUDPResolveFailure(host string, err error) {
+	if _, seen := udpResolveFailureLog.GetOrStore(host, func() struct{} { return struct{}{} }); seen {
+		log.Debugln("[UDP] Resolve Ip error (repeat, suppressed for %ds): %s", udpResolveFailureLogWindow, err)
+		return
+	}
+	log.Infoln("[UDP] Resolve Ip error: %s", err)
+}
 
 type packetSender struct {
 	ctx    context.Context
@@ -280,7 +317,7 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 			// TODO: ResolveUDP may take a long time to block the Process loop
 			//       but we want keep sequence sending so can't open a new goroutine
 			if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
-				log.Warnln("[UDP] Resolve Ip error: %s", err)
+				logUDPResolveFailure(metadata.Host, err)
 				return
 			}
 		}
