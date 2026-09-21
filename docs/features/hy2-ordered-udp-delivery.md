@@ -10,4 +10,7 @@ sing-quic 的 HY2 客户端原本为每个收到的 QUIC datagram 启动一个 g
 
 服务器网卡抓包会被 GRO 合并连发包，比对前须排除 IP 总长超过 MTU 或由多个包合成的记录，否则会误判为截断或拆包。
 
+本页修的是本机 goroutine 调度造成的乱序。链路本身造成的下行乱序见
+[HY2 下行 UDP 乱序恢复](hy2-downlink-reorder.md)。
+
 实现：`patches/sing-quic/0003-hysteria2-deliver-received-datagrams-in-order.patch`。构建前通过 `sh patches/apply-dependency-patches.sh` 应用依赖补丁。

@@ -1,0 +1,516 @@
+From c02693341eb863b7d0f59c6f29846626d2dd5117 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Sun, 20 Sep 2026 18:12:49 -0700
+Subject: [PATCH] hysteria2: restore the order the peer sent datagrams in
+
+---
+ hysteria2/packet.go       |  56 ++++++++
+ hysteria2/reorder.go      | 144 +++++++++++++++++++++
+ hysteria2/reorder_test.go | 262 ++++++++++++++++++++++++++++++++++++++
+ 3 files changed, 462 insertions(+)
+ create mode 100644 hysteria2/reorder.go
+ create mode 100644 hysteria2/reorder_test.go
+
+diff --git a/hysteria2/packet.go b/hysteria2/packet.go
+index 04728cd..72f8083 100644
+--- a/hysteria2/packet.go
++++ b/hysteria2/packet.go
+@@ -132,6 +132,7 @@ type udpPacketConn struct {
+ 	udpMTU          int
+ 	packetId        atomic.Uint32
+ 	closeOnce       sync.Once
++	reorder         udpReorder
+ 	defragger       *udpDefragger
+ 	onDestroy       func()
+ 	readWaitOptions N.ReadWaitOptions
+@@ -289,7 +290,49 @@ func (c *udpPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
+ 	return
+ }
+ 
++// inputPacket restores the order the peer sent this session's messages in
++// before the session sees any of them. A message that arrived early waits at
++// most udpReorderHold for the one it overtook; a peer that does not number its
++// messages never holds anything up.
+ func (c *udpPacketConn) inputPacket(message *udpMessage) {
++	r := &c.reorder
++	r.access.Lock()
++	ready := r.push(message)
++	if len(r.pending) > 0 {
++		if r.timer == nil {
++			r.gen++
++			gen := r.gen
++			r.timer = time.AfterFunc(udpReorderHold, func() { c.flushReorder(gen) })
++		}
++	} else if r.timer != nil {
++		r.timer.Stop()
++		r.timer = nil
++	}
++	r.access.Unlock()
++	for _, m := range ready {
++		c.inputOrdered(m)
++	}
++}
++
++// flushReorder gives up on a gap once the hold expires and releases what was
++// waiting behind it, still in order.
++func (c *udpPacketConn) flushReorder(gen uint64) {
++	r := &c.reorder
++	r.access.Lock()
++	if r.gen != gen {
++		// A later message already filled the gap and re-armed the timer.
++		r.access.Unlock()
++		return
++	}
++	r.timer = nil
++	ready := r.flush()
++	r.access.Unlock()
++	for _, m := range ready {
++		c.inputOrdered(m)
++	}
++}
++
++func (c *udpPacketConn) inputOrdered(message *udpMessage) {
+ 	if message.fragmentTotal <= 1 {
+ 		select {
+ 		case c.data <- message:
+@@ -335,6 +378,19 @@ func (c *udpPacketConn) Close() error {
+ 
+ func (c *udpPacketConn) closeWithError(err error) {
+ 	c.cancel(err)
++	// Nothing will read what is still waiting on a gap, and a flush after this
++	// point has no session left to deliver to.
++	r := &c.reorder
++	r.access.Lock()
++	if r.timer != nil {
++		r.timer.Stop()
++		r.timer = nil
++	}
++	r.gen++
++	pending := r.pending
++	r.pending = nil
++	r.access.Unlock()
++	releaseMessages(pending)
+ }
+ 
+ func (c *udpPacketConn) LocalAddr() net.Addr {
+diff --git a/hysteria2/reorder.go b/hysteria2/reorder.go
+new file mode 100644
+index 0000000..c05a5b1
+--- /dev/null
++++ b/hysteria2/reorder.go
+@@ -0,0 +1,144 @@
++package hysteria2
++
++import (
++	"sync"
++	"time"
++)
++
++const (
++	// udpReorderHold bounds how long messages that overtook a missing one wait
++	// for it. Swapped neighbours arrive well under a millisecond apart, so only
++	// real loss waits this long.
++	udpReorderHold = 2 * time.Millisecond
++	// udpReorderWindow is the largest packet ID gap still treated as reordering
++	// rather than loss or a restarted counter.
++	udpReorderWindow = 32
++	// udpReorderStreak is how many consecutive packet IDs a session must show
++	// before anything is held. Peers that leave the ID at zero or randomise it
++	// per message never get there and pass straight through.
++	udpReorderStreak = 8
++)
++
++// udpReorder restores the order a peer sent one session's messages in, after
++// the path swapped them. QUIC numbers its own packets, but RFC 9221 datagrams
++// are delivered as they arrive and that order is never restored, so a path
++// that reorders back-to-back packets looks like loss to whatever the datagrams
++// carry. hysteria2's own packet ID is what puts the order back.
++type udpReorder struct {
++	access  sync.Mutex
++	started bool
++	last    uint16
++	streak  int
++	pending []*udpMessage
++
++	timer *time.Timer
++	gen   uint64
++}
++
++// distance returns how far id lies ahead of the last released packet ID.
++// sing-quic counts modulo 65535 and never sends 0xFFFF, so crossing the wrap
++// does not count 0xFFFF as a gap.
++func (r *udpReorder) distance(id uint16) uint16 {
++	dist := id - r.last
++	if id < r.last && r.last != 0xFFFF && dist > 1 {
++		dist--
++	}
++	return dist
++}
++
++// push accepts a message and returns the messages that may be delivered now,
++// in order. Messages that overtook a missing one stay pending until it arrives
++// or flush is called.
++func (r *udpReorder) push(m *udpMessage) []*udpMessage {
++	id := m.packetID
++	if !r.started {
++		r.started = true
++		r.last = id
++		return []*udpMessage{m}
++	}
++	switch dist := r.distance(id); {
++	case dist == 0:
++		// Another fragment of the last message, or a peer that does not number
++		// its messages.
++		return []*udpMessage{m}
++	case dist == 1:
++		r.last = id
++		if r.streak < udpReorderStreak {
++			r.streak++
++		}
++		return r.release([]*udpMessage{m})
++	case dist <= udpReorderWindow && r.streak >= udpReorderStreak:
++		r.insert(id, dist, m)
++		if len(r.pending) > 2*udpReorderWindow {
++			return r.flush()
++		}
++		return nil
++	case dist >= 1<<16-udpReorderWindow:
++		// Arrived after its successors were already released.
++		return []*udpMessage{m}
++	default:
++		// A gap too large to wait for, or a peer that does not number messages
++		// sequentially.
++		ready := append(r.flush(), m)
++		r.last = id
++		r.streak = 0
++		return ready
++	}
++}
++
++// insert keeps pending sorted by distance, preserving arrival order among
++// fragments that share a packet ID.
++func (r *udpReorder) insert(id uint16, dist uint16, m *udpMessage) {
++	i := len(r.pending)
++	for i > 0 && r.distance(r.pending[i-1].packetID) > dist {
++		i--
++	}
++	r.pending = append(r.pending, nil)
++	copy(r.pending[i+1:], r.pending[i:])
++	r.pending[i] = m
++}
++
++// release appends the pending messages that now follow the last released
++// packet ID without a gap.
++func (r *udpReorder) release(ready []*udpMessage) []*udpMessage {
++	n := 0
++	for ; n < len(r.pending); n++ {
++		p := r.pending[n]
++		switch r.distance(p.packetID) {
++		case 0:
++		case 1:
++			r.last = p.packetID
++		default:
++			r.drop(n)
++			return ready
++		}
++		ready = append(ready, p)
++	}
++	r.drop(n)
++	return ready
++}
++
++// flush releases every pending message in order, giving up on the gaps.
++func (r *udpReorder) flush() []*udpMessage {
++	if len(r.pending) == 0 {
++		return nil
++	}
++	ready := make([]*udpMessage, 0, len(r.pending))
++	for _, p := range r.pending {
++		ready = append(ready, p)
++		r.last = p.packetID
++	}
++	r.drop(len(r.pending))
++	return ready
++}
++
++func (r *udpReorder) drop(n int) {
++	if n == 0 {
++		return
++	}
++	rest := copy(r.pending, r.pending[n:])
++	for i := rest; i < len(r.pending); i++ {
++		r.pending[i] = nil
++	}
++	r.pending = r.pending[:rest]
++}
+diff --git a/hysteria2/reorder_test.go b/hysteria2/reorder_test.go
+new file mode 100644
+index 0000000..c3e010b
+--- /dev/null
++++ b/hysteria2/reorder_test.go
+@@ -0,0 +1,262 @@
++package hysteria2
++
++import (
++	"context"
++	"testing"
++	"time"
++)
++
++func reorderMessage(id uint16, frag, total uint8) *udpMessage {
++	return &udpMessage{sessionID: 1, packetID: id, fragmentID: frag, fragmentTotal: total, destination: "203.0.113.1:443"}
++}
++
++// pushIDs pushes one message per ID and returns the IDs in delivery order.
++func pushIDs(r *udpReorder, ids ...uint16) []uint16 {
++	var got []uint16
++	for _, id := range ids {
++		for _, m := range r.push(reorderMessage(id, 0, 1)) {
++			got = append(got, m.packetID)
++		}
++	}
++	return got
++}
++
++func equalIDs(a, b []uint16) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if a[i] != b[i] {
++			return false
++		}
++	}
++	return true
++}
++
++func warmUp(t *testing.T, r *udpReorder, last uint16) {
++	t.Helper()
++	ids := make([]uint16, 0, udpReorderStreak+1)
++	for id := last - udpReorderStreak; id != last+1; id++ {
++		ids = append(ids, id)
++	}
++	if got := pushIDs(r, ids...); len(got) != len(ids) {
++		t.Fatalf("warm-up delivered %d of %d messages", len(got), len(ids))
++	}
++	if r.streak < udpReorderStreak {
++		t.Fatalf("streak = %d after warm-up", r.streak)
++	}
++}
++
++func TestUDPReorderPassesOrderedStream(t *testing.T) {
++	r := &udpReorder{}
++	for id := uint16(1); id <= 200; id++ {
++		got := r.push(reorderMessage(id, 0, 1))
++		if len(got) != 1 || len(r.pending) != 0 {
++			t.Fatalf("id %d: delivered %d, pending %d", id, len(got), len(r.pending))
++		}
++	}
++}
++
++func TestUDPReorderRestoresSwappedNeighbours(t *testing.T) {
++	r := &udpReorder{}
++	warmUp(t, r, 8)
++
++	if got := r.push(reorderMessage(10, 0, 1)); len(got) != 0 {
++		t.Fatalf("message ahead of a gap delivered immediately: %v", got)
++	}
++	got := r.push(reorderMessage(9, 0, 1))
++	if len(got) != 2 || got[0].packetID != 9 || got[1].packetID != 10 {
++		t.Fatalf("swapped pair not restored: %v", got)
++	}
++	if len(r.pending) != 0 {
++		t.Fatalf("pending = %d after the gap filled", len(r.pending))
++	}
++	if got := r.push(reorderMessage(11, 0, 1)); len(got) != 1 {
++		t.Fatalf("next message held: %v", got)
++	}
++}
++
++func TestUDPReorderFlushGivesUpOnLoss(t *testing.T) {
++	r := &udpReorder{}
++	warmUp(t, r, 8)
++
++	r.push(reorderMessage(10, 0, 1))
++	r.push(reorderMessage(12, 0, 1))
++	got := r.flush()
++	if len(got) != 2 || got[0].packetID != 10 || got[1].packetID != 12 {
++		t.Fatalf("flush order: %v", got)
++	}
++	if r.last != 12 {
++		t.Fatalf("last = %d after flush, want 12", r.last)
++	}
++	if got := r.push(reorderMessage(13, 0, 1)); len(got) != 1 {
++		t.Fatalf("message after flush held: %v", got)
++	}
++	if got := r.push(reorderMessage(9, 0, 1)); len(got) != 1 {
++		t.Fatalf("late message not delivered: %v", got)
++	}
++}
++
++func TestUDPReorderPassesUnnumberedPeers(t *testing.T) {
++	r := &udpReorder{}
++	for i := 0; i < 100; i++ {
++		if got := r.push(reorderMessage(0, 0, 1)); len(got) != 1 {
++			t.Fatalf("zero packet ID %d held", i)
++		}
++	}
++
++	r = &udpReorder{}
++	// Random IDs, as an older Xray server and the official client send.
++	for _, id := range []uint16{31337, 4242, 4244, 4243, 60001, 60003, 17, 19, 18, 900} {
++		for frag := uint8(0); frag < 2; frag++ {
++			if got := r.push(reorderMessage(id, frag, 2)); len(got) != 1 {
++				t.Fatalf("random packet ID %d held", id)
++			}
++		}
++	}
++}
++
++func TestUDPReorderCrossesSingQUICWrap(t *testing.T) {
++	r := &udpReorder{}
++	warmUp(t, r, 0xFFFE)
++	// sing-quic counts modulo 65535, so 0xFFFE is followed by 0.
++	if got := pushIDs(r, 0, 1, 2); len(got) != 3 || len(r.pending) != 0 {
++		t.Fatalf("wrap held messages: delivered %d, pending %d", len(got), len(r.pending))
++	}
++
++	r = &udpReorder{}
++	warmUp(t, r, 0xFFFE)
++	// A peer that uses the full range still wraps in order.
++	if got := pushIDs(r, 0xFFFF, 0, 1); len(got) != 3 || len(r.pending) != 0 {
++		t.Fatalf("full-range wrap held messages: delivered %d, pending %d", len(got), len(r.pending))
++	}
++
++	r = &udpReorder{}
++	warmUp(t, r, 0xFFFD)
++	// 0xFFFE missing, then 0 overtakes it across the wrap.
++	if got := pushIDs(r, 0); len(got) != 0 {
++		t.Fatalf("message across a gap at the wrap delivered: %v", got)
++	}
++	if got := pushIDs(r, 0xFFFE); !equalIDs(got, []uint16{0xFFFE, 0}) {
++		t.Fatalf("gap at the wrap not restored: %v", got)
++	}
++}
++
++func TestUDPReorderKeepsFragmentsTogether(t *testing.T) {
++	r := &udpReorder{}
++	warmUp(t, r, 8)
++
++	r.push(reorderMessage(10, 0, 2))
++	r.push(reorderMessage(10, 1, 2))
++	got := r.push(reorderMessage(9, 0, 1))
++	if len(got) != 3 {
++		t.Fatalf("delivered %d messages, want 3", len(got))
++	}
++	if got[0].packetID != 9 || got[1].fragmentID != 0 || got[2].fragmentID != 1 {
++		t.Fatalf("fragments not kept in arrival order behind the gap: %v", got)
++	}
++
++	// A further fragment of the last message passes straight through.
++	if got := r.push(reorderMessage(10, 1, 2)); len(got) != 1 {
++		t.Fatalf("fragment of the last message held: %v", got)
++	}
++}
++
++func TestUDPReorderLargeGapResetsStreak(t *testing.T) {
++	r := &udpReorder{}
++	warmUp(t, r, 8)
++
++	r.push(reorderMessage(10, 0, 1))
++	got := r.push(reorderMessage(8+udpReorderWindow+10, 0, 1))
++	if len(got) != 2 || got[0].packetID != 10 {
++		t.Fatalf("large gap: %v", got)
++	}
++	if r.streak != 0 {
++		t.Fatalf("streak = %d after a large gap", r.streak)
++	}
++	next := uint16(8 + udpReorderWindow + 12)
++	if got := r.push(reorderMessage(next, 0, 1)); len(got) != 1 {
++		t.Fatalf("message held without a streak: %v", got)
++	}
++}
++
++func TestUDPReorderBoundsPending(t *testing.T) {
++	r := &udpReorder{}
++	warmUp(t, r, 8)
++
++	var delivered int
++	for i := 0; i < 2*udpReorderWindow+1; i++ {
++		delivered += len(r.push(reorderMessage(10, uint8(i), 255)))
++	}
++	if delivered != 2*udpReorderWindow+1 || len(r.pending) != 0 {
++		t.Fatalf("overflow: delivered %d, pending %d", delivered, len(r.pending))
++	}
++}
++
++func receiveIDs(t *testing.T, c *udpPacketConn, n int, timeout time.Duration) []uint16 {
++	t.Helper()
++	var got []uint16
++	deadline := time.After(timeout)
++	for len(got) < n {
++		select {
++		case m := <-c.data:
++			got = append(got, m.packetID)
++		case <-deadline:
++			t.Fatalf("received %v, want %d messages", got, n)
++		}
++	}
++	return got
++}
++
++func TestUDPPacketConnReordersAndFlushes(t *testing.T) {
++	c := newUDPPacketConn(context.Background(), nil, func() {}, 1200)
++
++	// The first message only sets the starting ID.
++	for id := uint16(1); id <= udpReorderStreak+1; id++ {
++		c.inputPacket(reorderMessage(id, 0, 1))
++	}
++	c.inputPacket(reorderMessage(11, 0, 1))
++	c.inputPacket(reorderMessage(10, 0, 1))
++	want := []uint16{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
++	if got := receiveIDs(t, c, len(want), time.Second); !equalIDs(got, want) {
++		t.Fatalf("delivery order %v, want %v", got, want)
++	}
++
++	// 12 is lost: 13 is released once the hold expires.
++	start := time.Now()
++	c.inputPacket(reorderMessage(13, 0, 1))
++	if got := receiveIDs(t, c, 1, time.Second); got[0] != 13 {
++		t.Fatalf("flushed %v, want 13", got)
++	}
++	if waited := time.Since(start); waited < udpReorderHold {
++		t.Fatalf("message released after %v, before the %v hold", waited, udpReorderHold)
++	}
++	c.inputPacket(reorderMessage(14, 0, 1))
++	if got := receiveIDs(t, c, 1, time.Second); got[0] != 14 {
++		t.Fatalf("received %v, want 14", got)
++	}
++}
++
++func TestUDPPacketConnCloseStopsPendingFlush(t *testing.T) {
++	c := newUDPPacketConn(context.Background(), nil, func() {}, 1200)
++	for id := uint16(1); id <= udpReorderStreak+1; id++ {
++		c.inputPacket(reorderMessage(id, 0, 1))
++	}
++	receiveIDs(t, c, udpReorderStreak+1, time.Second)
++
++	c.inputPacket(reorderMessage(11, 0, 1))
++	c.reorder.access.Lock()
++	armed := c.reorder.timer != nil
++	c.reorder.access.Unlock()
++	if !armed {
++		t.Fatal("a message ahead of a gap did not arm the flush timer")
++	}
++
++	c.closeWithError(context.Canceled)
++	time.Sleep(5 * udpReorderHold)
++	c.reorder.access.Lock()
++	defer c.reorder.access.Unlock()
++	if c.reorder.timer != nil || len(c.reorder.pending) != 0 {
++		t.Fatal("close left the reorder timer or pending messages behind")
++	}
++}
+-- 
+2.55.0
+
