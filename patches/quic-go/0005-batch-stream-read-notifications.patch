@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Date: Tue, 22 Sep 2026 14:00:00 +0800
+Subject: [PATCH] quic: batch stream data wakeups over already received packets
+
+Make ordinary STREAM data notifications an opt-in connection-local batch
+after a stream has already delivered 64 KiB. Keep initial data immediate;
+the eligibility threshold never waits for more data.
+Keep the existing packet-drain loop and 32-packet fairness limit, and
+flush notifications on every return. Single-packet turns stay immediate. Do not wait for new
+data or impose a minimum read size. Keep terminal and deadline wakeups
+immediate, including gap fills after FIN and reliable resets.
+
+The batching helper and regression tests are provided in _files/.
+---
+diff --git a/config.go b/config.go
+index c7a000b..b2934f7 100644
+--- a/config.go
++++ b/config.go
+@@ -120,6 +120,7 @@ func populateConfig(config *Config) *Config {
+ 		MaxIncomingUniStreams:            maxIncomingUniStreams,
+ 		TokenStore:                       config.TokenStore,
+ 		EnableDatagrams:                  config.EnableDatagrams,
++		EnableStreamReadBatching:         config.EnableStreamReadBatching,
+ 		InitialPacketSize:                initialPacketSize,
+ 		DisablePathMTUDiscovery:          config.DisablePathMTUDiscovery,
+ 		MTUDiscoveryCache:                config.MTUDiscoveryCache,
+diff --git a/config_test.go b/config_test.go
+index 6da514a..3b7c33f 100644
+--- a/config_test.go
++++ b/config_test.go
+@@ -116,7 +116,7 @@ func configWithNonZeroNonFunctionFields(t *testing.T) *Config {
+ 			f.Set(reflect.ValueOf(&StatelessResetKey{1, 2, 3, 4}))
+ 		case "KeepAlivePeriod":
+ 			f.Set(reflect.ValueOf(time.Second))
+-		case "EnableDatagrams":
++		case "EnableDatagrams", "EnableStreamReadBatching":
+ 			f.Set(reflect.ValueOf(true))
+ 		case "DisableVersionNegotiationPackets":
+ 			f.Set(reflect.ValueOf(true))
+diff --git a/connection.go b/connection.go
+index 2a367d5..84704ed 100644
+--- a/connection.go
++++ b/connection.go
+@@ -1017,6 +1017,13 @@ func (c *Conn) handlePackets() (wasProcessed bool, _ error) {
+ 		return false, nil
+ 	}
+ 
++	if c.config.EnableStreamReadBatching && c.handshakeComplete && c.receivedPackets.Len() > 1 {
++		// Keep the existing packet-drain and ACK scheduling behavior. Only
++		// defer stream wakeups when there is already a batch to process.
++		c.streamsMap.readBatch.active = true
++		// Flush on every exit, including malformed packets and the packet cap.
++		defer c.streamsMap.readBatch.flush()
++	}
+ 	var hasMorePackets bool
+ 	for i := 0; i < maxPacketsToProcess; i++ {
+ 		p := c.receivedPackets.PopFront()
+diff --git a/interface.go b/interface.go
+index eadc018..18438bb 100644
+--- a/interface.go
++++ b/interface.go
+@@ -181,6 +181,12 @@ type Config struct {
+ 	Allow0RTT bool
+ 	// Enable QUIC datagram support (RFC 9221).
+ 	EnableDatagrams bool
++	// EnableStreamReadBatching defers ordinary stream-data wakeups until the
++	// current batch of already-received packets has been processed. It never
++	// waits for another packet or a minimum read size. FIN, reset, cancellation,
++	// deadline changes and connection shutdown still wake readers immediately.
++	// This is a local receive optimization; it does not change the wire format.
++	EnableStreamReadBatching bool
+ 	// Enable QUIC Stream Resets with Partial Delivery.
+ 	// See https://datatracker.ietf.org/doc/html/draft-ietf-quic-reliable-stream-reset-09.
+ 	EnableStreamResetPartialDelivery bool
+diff --git a/receive_stream.go b/receive_stream.go
+index 4222a9b..327ac7d 100644
+--- a/receive_stream.go
++++ b/receive_stream.go
+@@ -49,6 +49,11 @@ type ReceiveStream struct {
+ 	readOnce chan struct{} // cap: 1, to protect against concurrent use of Read
+ 	deadline monotime.Time
+ 
++	// Intrusive pending-wakeup list. These fields belong exclusively to the
++	// connection goroutine; Read and immediate terminal wakeups never touch them.
++	readBatchNext   *ReceiveStream
++	readBatchQueued bool
++
+ 	flowController *streamFlowController
+ }
+ 
+@@ -430,8 +435,12 @@ func (s *ReceiveStream) cancelReadImpl(errorCode qerr.StreamErrorCode) (queuedNe
+ }
+ 
+ func (s *ReceiveStream) handleStreamFrame(frame *wire.StreamFrame, now monotime.Time) error {
++	return s.handleStreamFrameWithReadBatch(frame, now, nil)
++}
++
++func (s *ReceiveStream) handleStreamFrameWithReadBatch(frame *wire.StreamFrame, now monotime.Time, batch *streamReadBatch) error {
+ 	s.mutex.Lock()
+-	err := s.handleStreamFrameImpl(frame, now)
++	err := s.handleStreamFrameImpl(frame, now, batch)
+ 	completed := s.isNewlyCompleted()
+ 	size, callback := s.takeReceiveFinalSizeCallback()
+ 	s.mutex.Unlock()
+@@ -446,7 +455,7 @@ func (s *ReceiveStream) handleStreamFrame(frame *wire.StreamFrame, now monotime.
+ 	return err
+ }
+ 
+-func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monotime.Time) error {
++func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monotime.Time, batch *streamReadBatch) error {
+ 	if s.closeForShutdownErr != nil {
+ 		return nil
+ 	}
+@@ -463,7 +472,13 @@ func (s *ReceiveStream) handleStreamFrameImpl(frame *wire.StreamFrame, now monot
+ 	if err := s.frameQueue.Push(frame.Data, frame.Offset, frame.PutBack); err != nil {
+ 		return err
+ 	}
+-	s.signalRead()
++	if batch == nil || s.readPos < minStreamReadBatchReadPos || s.finalOffset != protocol.MaxByteCount || s.cancelledRemotely {
++		// Also wake immediately when a non-FIN frame fills a gap before a
++		// previously received FIN or RESET_STREAM_AT reliable-size boundary.
++		s.signalRead()
++	} else {
++		batch.add(s)
++	}
+ 	return nil
+ }
+ 
+diff --git a/streams_map.go b/streams_map.go
+index 6f3e86e..ca99aba 100644
+--- a/streams_map.go
++++ b/streams_map.go
+@@ -36,6 +36,9 @@ type streamsMap struct {
+ 	incomingUniStreams    *incomingStreamsMap[*ReceiveStream]
+ 	reset                 bool
+ 	supportsResetStreamAt bool
++
++	// Used only by the connection's packet-processing goroutine.
++	readBatch streamReadBatch
+ }
+ 
+ func newStreamsMap(
+@@ -313,6 +316,14 @@ func (m *streamsMap) HandleStreamFrame(f *wire.StreamFrame, rcvTime monotime.Tim
+ 	if str == nil { // stream already deleted
+ 		return nil
+ 	}
++	if m.readBatch.active {
++		switch str := str.(type) {
++		case *Stream:
++			return str.receiveStr.handleStreamFrameWithReadBatch(f, rcvTime, &m.readBatch)
++		case *ReceiveStream:
++			return str.handleStreamFrameWithReadBatch(f, rcvTime, &m.readBatch)
++		}
++	}
+ 	return str.handleStreamFrame(f, rcvTime)
+ }
+ 

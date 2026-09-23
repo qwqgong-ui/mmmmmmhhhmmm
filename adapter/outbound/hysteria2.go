@@ -204,6 +204,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		// quic.Config carrying more than one version, so quic-go's Version
 		// Negotiation fallback is not available here. Servers must support v2.
 		Versions:                       []quic.Version{quic.Version2},
+		EnableStreamReadBatching:       true,
 		InitialStreamReceiveWindow:     option.InitialStreamReceiveWindow,
 		MaxStreamReceiveWindow:         option.MaxStreamReceiveWindow,
 		InitialConnectionReceiveWindow: option.InitialConnectionReceiveWindow,

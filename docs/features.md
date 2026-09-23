@@ -42,6 +42,7 @@ Go module，因此它们的补丁继续保存在 `patches/` 下并由构建流�
 - [HY2 叶节点跨连接 MTU 缓存](features/hy2-leaf-mtu-cache.md)
 - [HY2 UDP 按序交付（HY2 Ordered UDP Delivery）](features/hy2-ordered-udp-delivery.md)
 - [HY2 下行 UDP 乱序恢复（Downlink Reorder）](features/hy2-downlink-reorder.md)
+- [HY2 stream 数据通知按收包批次合并](features/hy2-stream-read-batching.md)
 - [拒绝规则提前结束处理（Reject-Rule Short-Circuit）](features/reject-rule-short-circuit.md)
 - [DNS 默认超时 3 秒（3s Default DNS Timeout）](features/3s-default-dns-timeout.md)
 - [扩大 DNS 缓存并延长乐观缓存 TTL（Larger DNS Cache and Softer Optimistic TTL）](features/larger-dns-cache-and-softer-optimistic-ttl.md)
