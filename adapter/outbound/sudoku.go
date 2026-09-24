@@ -79,7 +79,9 @@ func (s *Sudoku) DialContext(ctx context.Context, metadata *C.Metadata) (_ C.Con
 	if err != nil {
 		return nil, err
 	}
-	defer func() { safeConnClose(c, err) }()
+	defer func(c net.Conn) {
+		safeConnClose(c, err)
+	}(c)
 
 	addrBuf, err := sudoku.EncodeAddress(cfg.TargetAddress)
 	if err != nil {
@@ -324,7 +326,9 @@ func (s *Sudoku) dialAndHandshake(ctx context.Context, cfg *sudoku.ProtocolConfi
 		return nil, fmt.Errorf("%s connect error: %w", s.addr, err)
 	}
 
-	defer func() { safeConnClose(c, err) }()
+	defer func(c net.Conn) {
+		safeConnClose(c, err)
+	}(c)
 
 	if ctx.Done() != nil {
 		done := N.SetupContextForConn(ctx, c)
