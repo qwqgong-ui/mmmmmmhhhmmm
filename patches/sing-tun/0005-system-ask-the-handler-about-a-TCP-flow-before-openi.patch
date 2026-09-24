@@ -1,96 +1,57 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: qwqgong-ui <noreply@qwqgong-ui.local>
-Date: Wed, 26 Aug 2026 17:13:12 +0800
-Subject: [PATCH 5/5] system: ask the handler about a TCP flow before opening
- it
-
-Upstream sing-tun consults the handler when a TCP flow is first seen and
-turns ErrDrop into a silent drop and any other error into a RST, so a
-rejected connection never completes a local handshake. This fork only wired
-PrepareConnection up for ICMP, so a rejected TCP flow was accepted by the
-forwarder, handed to the handler and closed again, which the client sees as
-a connection that opened and immediately died rather than a refusal.
-
-Route the first packet of a flow through PrepareConnection and answer with a
-drop or a RST accordingly. Handlers that do not care keep returning nil and
-nothing changes for them, which is the case for mihomo today.
-
-The call happens on the packet processing goroutine, so a handler must not
-block in it.
-
-UDP is deliberately left alone: upstream hooks it through the udpnat2
-service it owns, and this fork has no stack level UDP session table to hang
-the decision on -- mihomo keeps its own NAT in the tunnel, and adding a
-second one here just to find the first packet of a session would cost more
-than it saves.
----
- stack_system.go     | 14 ++++++++++----
- stack_system_nat.go | 14 +++++++++++++-
- 2 files changed, 23 insertions(+), 5 deletions(-)
-
 diff --git a/stack_system.go b/stack_system.go
-index 44f1091..43fe9fd 100644
+index fd29fdc..16a9d3c 100644
 --- a/stack_system.go
 +++ b/stack_system.go
-@@ -425,9 +425,12 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
+@@ -441,8 +441,11 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
  			}
  		}
  		if !loopback {
--			natPort, err := s.tcpNat.Lookup(source, destination)
-+			natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
+-			natPort, err := s.tcpNat4.Lookup(source, destination)
++			natPort, err := s.tcpNat4.Lookup(source, destination, s.handler)
  			if err != nil {
--				return false, nil // nat table exhausted, drop
 +				if errors.Is(err, ErrDrop) {
 +					return false, nil
 +				}
-+				return false, s.resetIPv4TCP(ipHdr, tcpHdr)
+ 				return false, s.resetIPv4TCP(ipHdr, tcpHdr)
  			}
- 			ipHdr.SetSourceAddr(s.inet4NextAddress)
- 			tcpHdr.SetSourcePort(natPort)
-@@ -519,9 +522,12 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
+ 			rewriteIPv4TCP(ipHdr, tcpHdr, s.txChecksumOffload,
+@@ -526,8 +529,11 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
  			}
  		}
  		if !loopback {
--			natPort, err := s.tcpNat.Lookup(source, destination)
-+			natPort, err := s.tcpNat.Lookup(source, destination, s.handler)
+-			natPort, err := s.tcpNat6.Lookup(source, destination)
++			natPort, err := s.tcpNat6.Lookup(source, destination, s.handler)
  			if err != nil {
--				return false, nil // nat table exhausted, drop
 +				if errors.Is(err, ErrDrop) {
 +					return false, nil
 +				}
-+				return false, s.resetIPv6TCP(ipHdr, tcpHdr)
+ 				return false, s.resetIPv6TCP(ipHdr, tcpHdr)
  			}
- 			ipHdr.SetSourceAddr(s.inet6NextAddress)
- 			tcpHdr.SetSourcePort(natPort)
+ 			rewriteIPv6TCP(ipHdr, tcpHdr, s.txChecksumOffload,
 diff --git a/stack_system_nat.go b/stack_system_nat.go
-index e00344d..ed6546e 100644
+index 2eb2964..ff77977 100644
 --- a/stack_system_nat.go
 +++ b/stack_system_nat.go
-@@ -6,6 +6,9 @@ import (
- 	"sync"
- 	"sync/atomic"
+@@ -8,6 +8,8 @@ import (
  	"time"
-+
+ 
+ 	E "github.com/metacubex/sing/common/exceptions"
 +	M "github.com/metacubex/sing/common/metadata"
 +	N "github.com/metacubex/sing/common/network"
  )
  
  const (
-@@ -96,7 +99,12 @@ func (n *TCPNat) LookupBack(port uint16) *TCPSession {
+@@ -98,7 +100,8 @@ func (n *TCPNat) LookupBack(port uint16) *TCPSession {
  	return session
  }
  
 -func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) (uint16, error) {
-+// Lookup returns the NAT port a flow is forwarded through, asking the handler
-+// whether the flow may be established the first time it is seen. A handler
-+// that answers with ErrDrop or ErrReset never sees the connection: the SYN is
-+// dropped or answered with a RST instead of completing a local handshake that
-+// is closed again right after the accept.
++// Lookup asks the handler before allocating a port for a new TCP flow.
 +func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort, handler Handler) (uint16, error) {
  	key := tcpNatKey{Source: source, Destination: destination}
  	n.addrAccess.RLock()
  	port, loaded := n.addrMap[key]
-@@ -104,6 +112,10 @@ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) (uint
+@@ -109,6 +112,10 @@ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) (uint
  	if loaded {
  		return port, nil
  	}

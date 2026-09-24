@@ -1,65 +1,15 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: qwqgong-ui <noreply@qwqgong-ui.local>
-Date: Wed, 26 Aug 2026 17:07:21 +0800
-Subject: [PATCH 2/5] system: make the TCP NAT reverse lookup lock-free and
- stop reusing live ports
-
-LookupBack() runs for every packet coming back from the forwarder, and it
-took an RWMutex read lock, hashed a map and then locked the session just to
-refresh a timestamp. Index the sessions by NAT port in a flat array of
-atomic pointers instead, and keep the last-active time in an atomic seconds
-counter, so the reverse path is a plain atomic load. The array costs 444 KiB
-for the 10000-65535 port range.
-
-Allocation is also fixed: the old counter handed out portIndex++ with no
-check, so once it wrapped it could return a port that still belonged to a
-live session, and two goroutines racing on the same flow each allocated a
-port, leaking the first one into portMap forever. Allocation now re-checks
-the address map under the write lock and scans for a genuinely free slot,
-reporting ErrDrop when the table is full instead of returning port 0.
----
- stack_system.go     |  10 +++-
- stack_system_nat.go | 110 +++++++++++++++++++++++++++-----------------
- 2 files changed, 77 insertions(+), 43 deletions(-)
-
-diff --git a/stack_system.go b/stack_system.go
-index 2ae943a..01ac3d8 100644
---- a/stack_system.go
-+++ b/stack_system.go
-@@ -425,7 +425,10 @@ func (s *System) processIPv4TCP(ipHdr header.IPv4, tcpHdr header.TCP) (bool, err
- 			}
- 		}
- 		if !loopback {
--			natPort := s.tcpNat.Lookup(source, destination)
-+			natPort, err := s.tcpNat.Lookup(source, destination)
-+			if err != nil {
-+				return false, nil // nat table exhausted, drop
-+			}
- 			ipHdr.SetSourceAddr(s.inet4NextAddress)
- 			tcpHdr.SetSourcePort(natPort)
- 			ipHdr.SetDestinationAddr(s.inet4Address)
-@@ -513,7 +516,10 @@ func (s *System) processIPv6TCP(ipHdr header.IPv6, tcpHdr header.TCP) (bool, err
- 			}
- 		}
- 		if !loopback {
--			natPort := s.tcpNat.Lookup(source, destination)
-+			natPort, err := s.tcpNat.Lookup(source, destination)
-+			if err != nil {
-+				return false, nil // nat table exhausted, drop
-+			}
- 			ipHdr.SetSourceAddr(s.inet6NextAddress)
- 			tcpHdr.SetSourcePort(natPort)
- 			ipHdr.SetDestinationAddr(s.inet6Address)
 diff --git a/stack_system_nat.go b/stack_system_nat.go
-index fd0e382..e00344d 100644
+index bd0632a..2eb2964 100644
 --- a/stack_system_nat.go
 +++ b/stack_system_nat.go
-@@ -4,16 +4,27 @@ import (
+@@ -4,18 +4,27 @@ import (
  	"context"
  	"net/netip"
  	"sync"
 +	"sync/atomic"
  	"time"
+ 
+ 	E "github.com/metacubex/sing/common/exceptions"
  )
  
 +const (
@@ -73,12 +23,10 @@ index fd0e382..e00344d 100644
 -	portAccess sync.RWMutex
 +	timeout time.Duration
 +
-+	// portMap is indexed by natPort-tcpNatPortStart and read without locking:
-+	// LookupBack() runs for every packet of the forwarder-to-client direction.
++	// Reverse lookups run for every packet returning from the forwarder.
 +	portMap []atomic.Pointer[TCPSession]
 +
-+	// addrAccess guards addrMap, portIndex and slot allocation in portMap.
-+	// It is only taken on the new-session and timeout paths.
++	// addrAccess also guards portIndex and slot allocation/removal.
  	addrAccess sync.RWMutex
  	addrMap    map[tcpNatKey]uint16
 -	portMap    map[uint16]*TCPSession
@@ -86,7 +34,7 @@ index fd0e382..e00344d 100644
  }
  
  type tcpNatKey struct {
-@@ -22,18 +33,20 @@ type tcpNatKey struct {
+@@ -24,18 +33,27 @@ type tcpNatKey struct {
  }
  
  type TCPSession struct {
@@ -94,11 +42,18 @@ index fd0e382..e00344d 100644
  	Source      netip.AddrPort
  	Destination netip.AddrPort
 -	LastActive  time.Time
-+	lastActive  atomic.Int64 // unix seconds
++	lastActive  atomic.Int64 // Unix seconds
 +}
 +
 +func (s *TCPSession) LastActive() time.Time {
 +	return time.Unix(s.lastActive.Load(), 0)
++}
++
++func (s *TCPSession) refresh() {
++	now := time.Now().Unix()
++	if now != s.lastActive.Load() {
++		s.lastActive.Store(now)
++	}
  }
  
  func NewNat(ctx context.Context, timeout time.Duration) *TCPNat {
@@ -113,22 +68,39 @@ index fd0e382..e00344d 100644
  	}
  	go natMap.loopCheckTimeout(ctx)
  	return natMap
-@@ -53,59 +66,74 @@ func (n *TCPNat) loopCheckTimeout(ctx context.Context) {
+@@ -55,64 +73,40 @@ func (n *TCPNat) loopCheckTimeout(ctx context.Context) {
  }
  
  func (n *TCPNat) checkTimeout() {
 -	now := time.Now()
--	n.portAccess.Lock()
--	defer n.portAccess.Unlock()
+-	type expiredSession struct {
+-		port    uint16
+-		session *TCPSession
+-	}
+-	var expired []expiredSession
+-	n.portAccess.RLock()
+-	for natPort, session := range n.portMap {
+-		session.Lock()
+-		timedOut := now.Sub(session.LastActive) > n.timeout
+-		session.Unlock()
+-		if timedOut {
+-			expired = append(expired, expiredSession{port: natPort, session: session})
+-		}
+-	}
+-	n.portAccess.RUnlock()
+-	if len(expired) == 0 {
+-		return
+-	}
 +	now := time.Now().Unix()
 +	timeout := int64(n.timeout / time.Second)
  	n.addrAccess.Lock()
- 	defer n.addrAccess.Unlock()
--	for natPort, session := range n.portMap {
--		session.Lock()
--		if now.Sub(session.LastActive) > n.timeout {
--			delete(n.addrMap, tcpNatKey{Source: session.Source, Destination: session.Destination})
--			delete(n.portMap, natPort)
+-	n.portAccess.Lock()
+-	for _, e := range expired {
+-		e.session.Lock()
+-		if now.Sub(e.session.LastActive) > n.timeout {
+-			delete(n.addrMap, tcpNatKey{Source: e.session.Source, Destination: e.session.Destination})
+-			delete(n.portMap, e.port)
++	defer n.addrAccess.Unlock()
 +	for key, natPort := range n.addrMap {
 +		slot := &n.portMap[natPort-tcpNatPortStart]
 +		session := slot.Load()
@@ -136,8 +108,10 @@ index fd0e382..e00344d 100644
 +			delete(n.addrMap, key)
 +			slot.Store(nil)
  		}
--		session.Unlock()
+-		e.session.Unlock()
  	}
+-	n.portAccess.Unlock()
+-	n.addrAccess.Unlock()
  }
  
  func (n *TCPNat) LookupBack(port uint16) *TCPSession {
@@ -149,73 +123,83 @@ index fd0e382..e00344d 100644
 +	}
 +	session := n.portMap[port-tcpNatPortStart].Load()
  	if session != nil {
--		session.Lock()
--		if time.Since(session.LastActive) > time.Second {
--			session.LastActive = time.Now()
-+		// second resolution is enough for the timeout check and keeps this
-+		// store off the cache line most of the time
-+		now := time.Now().Unix()
-+		if now != session.lastActive.Load() {
-+			session.lastActive.Store(now)
- 		}
--		session.Unlock()
+ 		session.refresh()
  	}
  	return session
  }
  
--func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) uint16 {
-+func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) (uint16, error) {
+-func (s *TCPSession) refresh() {
+-	s.Lock()
+-	if time.Since(s.LastActive) > time.Second {
+-		s.LastActive = time.Now()
+-	}
+-	s.Unlock()
+-}
+-
+ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) (uint16, error) {
  	key := tcpNatKey{Source: source, Destination: destination}
  	n.addrAccess.RLock()
  	port, loaded := n.addrMap[key]
- 	n.addrAccess.RUnlock()
+-	n.addrAccess.RUnlock()
  	if loaded {
--		return port
-+		return port, nil
+ 		n.refresh(port)
++	}
++	n.addrAccess.RUnlock()
++	if loaded {
+ 		return port, nil
  	}
  	n.addrAccess.Lock()
--	nextPort := n.portIndex
--	if nextPort == 0 {
--		nextPort = 10000
--		n.portIndex = 10001
--	} else {
--		n.portIndex++
-+	defer n.addrAccess.Unlock()
-+	port, loaded = n.addrMap[key]
-+	if loaded { // another packet of the same flow won the race
-+		return port, nil
+@@ -122,41 +116,29 @@ func (n *TCPNat) Lookup(source netip.AddrPort, destination netip.AddrPort) (uint
+ 		n.refresh(port)
+ 		return port, nil
  	}
--	n.addrMap[key] = nextPort
--	n.addrAccess.Unlock()
 -	n.portAccess.Lock()
--	n.portMap[nextPort] = &TCPSession{
-+	session := &TCPSession{
- 		Source:      source,
- 		Destination: destination,
--		LastActive:  time.Now(),
+-	defer n.portAccess.Unlock()
+-	nextPort, ok := n.allocatePortLocked()
++	port, ok := n.allocatePortLocked()
+ 	if !ok {
+ 		return 0, E.New("NAT port space exhausted")
  	}
--	n.portAccess.Unlock()
--	return nextPort
+-	n.portMap[nextPort] = &TCPSession{
+-		Source:      source,
+-		Destination: destination,
+-		LastActive:  time.Now(),
+-	}
+-	n.addrMap[key] = nextPort
+-	return nextPort, nil
++	session := &TCPSession{Source: source, Destination: destination}
 +	session.lastActive.Store(time.Now().Unix())
-+	port, allocated := n.allocateLocked(session)
-+	if !allocated {
-+		return 0, ErrDrop
-+	}
++	n.portMap[port-tcpNatPortStart].Store(session)
 +	n.addrMap[key] = port
 +	return port, nil
-+}
-+
-+// allocateLocked claims a free slot for session, starting from the last one
-+// handed out. Unlike a bare counter it never returns a port that still belongs
-+// to a live session.
-+func (n *TCPNat) allocateLocked(session *TCPSession) (uint16, bool) {
+ }
+ 
+ func (n *TCPNat) refresh(port uint16) {
+-	n.portAccess.RLock()
+-	session := n.portMap[port]
+-	n.portAccess.RUnlock()
+-	if session != nil {
++	if session := n.portMap[port-tcpNatPortStart].Load(); session != nil {
+ 		session.refresh()
+ 	}
+ }
+ 
+ func (n *TCPNat) allocatePortLocked() (uint16, bool) {
+-	for i := 0; i < 65535-10000+1; i++ {
+-		nextPort := n.portIndex
+-		if nextPort == 0 {
+-			nextPort = 10000
+-			n.portIndex = 10001
+-		} else {
+-			n.portIndex++
+-		}
+-		if _, occupied := n.portMap[nextPort]; !occupied {
+-			return nextPort, true
 +	for i := uint32(0); i < tcpNatPortCount; i++ {
 +		index := (n.portIndex + i) % tcpNatPortCount
 +		if n.portMap[index].Load() == nil {
-+			n.portMap[index].Store(session)
 +			n.portIndex = (index + 1) % tcpNatPortCount
 +			return uint16(index + tcpNatPortStart), true
-+		}
-+	}
-+	return 0, false
- }
+ 		}
+ 	}
+ 	return 0, false
