@@ -66,7 +66,7 @@ func (r *Resolver) directCachedCandidates(key string, sourceCount int) []netip.A
 	seen := make(map[netip.Addr]struct{})
 	var candidates []netip.Addr
 	for source := 0; source < min(sourceCount, len(r.sourceCaches)); source++ {
-		msg, _, hit := r.sourceCaches[source].GetWithExpire(r.directSourceCacheKey(key, source))
+		msg, _, hit := readUpstreamCache(r.sourceCaches[source], r.directSourceCacheKey(key, source))
 		if !hit || msg == nil {
 			continue
 		}
@@ -113,7 +113,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 					return msg, due, nil
 				})
 			}
-			if msg, due, hit := r.cache.GetWithExpire(key); hit {
+			if msg, due, hit := readUpstreamCache(r.cache, key); hit {
 				if !time.Now().Before(due) {
 					refresh()
 				}
@@ -130,7 +130,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 		}
 		candidates := r.directCachedCandidates(key, len(r.main))
 		fresh := false
-		if msg, due, hit := r.cache.GetWithExpire(key); hit && msg != nil {
+		if msg, due, hit := readUpstreamCache(r.cache, key); hit && msg != nil {
 			if len(candidates) == 0 {
 				candidates = append(candidates, msgToIP(msg)...)
 			}
@@ -138,7 +138,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 		}
 		hasStaleSource := false
 		for source, c := range r.sourceCaches {
-			if _, due, hit := c.GetWithExpire(r.directSourceCacheKey(key, source)); hit {
+			if _, due, hit := readUpstreamCache(c, r.directSourceCacheKey(key, source)); hit {
 				if time.Now().Before(due) {
 					fresh = true
 				} else {
@@ -164,7 +164,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 		}
 		fetch := func(source int) (*D.Msg, error) {
 			c := r.sourceCaches[source]
-			if msg, due, hit := c.GetWithExpire(r.directSourceCacheKey(key, source)); hit && time.Now().Before(due) {
+			if msg, due, hit := readUpstreamCache(c, r.directSourceCacheKey(key, source)); hit && time.Now().Before(due) {
 				return msg, nil
 			}
 			wait := c.Refresh(r.directSourceCacheKey(key, source), R.DefaultDNSTimeout, func(work context.Context) (*D.Msg, time.Time, error) {
@@ -187,7 +187,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			// due. A long TTL on one upstream must not postpone another's refresh.
 			sources := make([]int, 0, len(r.main))
 			for source, c := range r.sourceCaches {
-				_, due, hit := c.GetWithExpire(r.directSourceCacheKey(key, source))
+				_, due, hit := readUpstreamCache(c, r.directSourceCacheKey(key, source))
 				if source < 2 || (hit && !time.Now().Before(due)) {
 					sources = append(sources, source)
 				}

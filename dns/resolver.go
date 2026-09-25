@@ -166,7 +166,7 @@ func (r *Resolver) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error
 	request := m.Copy()
 	request.Question[0].Name = strings.ToLower(request.Question[0].Name)
 	key := dev_cache.ScopedKey(dev_cache.CurrentScope(), request.Question[0].String())
-	if msg, due, hit := r.cache.GetWithExpire(key); hit && msg != nil {
+	if msg, due, hit := readUpstreamCache(r.cache, key); hit && msg != nil {
 		if !time.Now().Before(due) {
 			logDNSCache(request.Question[0], "stale", strings.SplitN(key, keySep, 2)[0])
 			r.refreshAnswer(key, request)
@@ -505,12 +505,18 @@ func (rs Resolvers) ClearCache() {
 	rs.Resolver.ClearCache()
 	rs.ProxyResolver.ClearCache()
 	rs.DirectResolver.ClearCache()
+	if rs.BootstrapResolver != rs.Resolver && rs.BootstrapResolver != rs.ProxyResolver {
+		rs.BootstrapResolver.ClearCache()
+	}
 }
 
 func (rs Resolvers) ClearVolatileCache() {
 	rs.Resolver.ClearVolatileCache()
 	rs.ProxyResolver.ClearVolatileCache()
 	rs.DirectResolver.ClearVolatileCache()
+	if rs.BootstrapResolver != rs.Resolver && rs.BootstrapResolver != rs.ProxyResolver {
+		rs.BootstrapResolver.ClearVolatileCache()
+	}
 }
 
 func (rs Resolvers) ResetConnection() {

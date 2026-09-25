@@ -34,6 +34,9 @@ func exchangeDiagnostic(ctx context.Context, client dnsClient, query *D.Msg, sou
 		start = time.Now()
 	}
 	msg, err = client.ExchangeContext(ctx, query)
+	if err == nil && hasUpstreamFakeIP(msg) {
+		msg, err = nil, errUpstreamFakeIP
+	}
 	if err != nil && !errors.Is(err, context.Canceled) {
 		diagstats.Add(diagstats.DNSUpstreamError)
 	}

@@ -79,6 +79,25 @@ func (c *Cache[K, V]) GetWithExpire(key K) (V, time.Time, bool) {
 	return c.data.GetWithExpire(key)
 }
 func (c *Cache[K, V]) Get(key K) (V, bool) { v, _, ok := c.GetWithExpire(key); return v, ok }
+
+// GetWithExpireValidated discards only a rejected value that is still present.
+// A miss must leave an in-flight refresh intact; an unconditional Delete would
+// cancel coalesced work started by another reader of the same missing key.
+func (c *Cache[K, V]) GetWithExpireValidated(key K, accept func(V) bool) (V, time.Time, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	value, due, hit := c.data.GetWithExpire(key)
+	if hit && !accept(value) {
+		// The retained value is invalid; an active refresh can still replace it
+		// with a valid answer. Keep that flight available to its waiters.
+		c.data.Delete(key)
+		delete(c.retry, key)
+		var zero V
+		return zero, time.Time{}, false
+	}
+	return value, due, hit
+}
+
 func (c *Cache[K, V]) SetWithExpire(key K, value V, due time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
