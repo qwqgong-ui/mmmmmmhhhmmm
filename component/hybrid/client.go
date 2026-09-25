@@ -68,10 +68,13 @@ type clientFlow struct {
 	// these are atomic rather than guarded. Every reader tests disabled first,
 	// which is what keeps an activation racing a fallback from reviving raw.
 	disabled, active    atomic.Bool
+	confirmedRaw        atomic.Bool  // a reply using an observed client CID reached raw
 	lastRaw             atomic.Int64 // last raw reply, unix nanoseconds; zero until the first
-	probeEnd, nextProbe time.Time    // protected by writeMu
-	retryAt             time.Time    // earliest next probe cycle, protected by writeMu
-	retries             int          // recoverable fallbacks charged so far, protected by writeMu
+	cidMu               sync.RWMutex
+	clientCIDs          []string  // SCIDs in client long headers; bound the first raw reply
+	probeEnd, nextProbe time.Time // protected by writeMu
+	retryAt             time.Time // earliest next probe cycle, protected by writeMu
+	retries             int       // recoverable fallbacks charged so far, protected by writeMu
 	done                chan struct{}
 	diagnostic          *flowDiagnostic
 }
@@ -291,6 +294,9 @@ func (f *clientFlow) idleFor(now time.Time) time.Duration {
 func (f *clientFlow) write(p []byte) (int, error) {
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
+	if _, scid, ok := LongCIDs(p); ok && scid != "" {
+		f.rememberClientCID(scid)
+	}
 	now := time.Now()
 	raw, probe := false, false
 	if !f.disabled.Load() && Short(p) {
@@ -342,6 +348,31 @@ func (f *clientFlow) write(p []byte) (int, error) {
 		}
 	}
 	return len(p), nil
+}
+func (f *clientFlow) rememberClientCID(cid string) {
+	f.cidMu.Lock()
+	defer f.cidMu.Unlock()
+	for _, known := range f.clientCIDs {
+		if known == cid {
+			return
+		}
+	}
+	if len(f.clientCIDs) == 8 {
+		copy(f.clientCIDs, f.clientCIDs[1:])
+		f.clientCIDs[7] = cid
+	} else {
+		f.clientCIDs = append(f.clientCIDs, cid)
+	}
+}
+func (f *clientFlow) matchesClientCID(p []byte) bool {
+	f.cidMu.RLock()
+	defer f.cidMu.RUnlock()
+	for _, cid := range f.clientCIDs {
+		if len(p) > 1+len(cid) && string(p[1:1+len(cid)]) == cid {
+			return true
+		}
+	}
+	return false
 }
 func (f *clientFlow) readStream() {
 	defer func() {
@@ -402,8 +433,16 @@ func (f *clientFlow) readRaw() {
 		if f.disabled.Load() {
 			continue
 		}
+		// An unclaimed probe on a shared HY2 listener can elicit a QUIC
+		// stateless reset: it has a short header and comes from the relay,
+		// but its random destination CID is not one the client advertised.
+		if !f.confirmedRaw.Load() && !f.matchesClientCID(b[:n]) {
+			f.diagnostic.countOne(rawDropped)
+			continue
+		}
 		now := time.Now()
 		becameActive := f.active.CompareAndSwap(false, true)
+		f.confirmedRaw.Store(true)
 		f.lastRaw.Store(now.UnixNano())
 		f.diagnostic.count(rawRxPackets, rawRxBytes, n)
 		f.diagnostic.touch(now)

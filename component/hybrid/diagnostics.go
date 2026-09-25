@@ -31,8 +31,9 @@ type FlowSnapshot struct {
 // Counters report where a flow's datagrams actually went. Raw and stream cover
 // the same flow, so their sum is all of its traffic; a flow on raw still sends
 // long-header packets over the stream. Dropped and errors exist only on raw:
-// dropped counts datagrams from another source or without a short header, and
-// errors the ICMP messages a connected raw socket reports, none of which are
+// dropped counts datagrams from another source, without a short header, or with
+// an unknown destination CID before the first confirmed raw reply. Errors count
+// ICMP messages a connected raw socket reports, none of which are
 // by themselves a reason to fall back. Fallbacks counts every return to the
 // stream and activations every arrival on raw, so a flow that keeps recovering
 // is visible as activations beyond the first.

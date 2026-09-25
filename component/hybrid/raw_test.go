@@ -384,6 +384,7 @@ func TestRepeatedFailuresGiveRawUpForGood(t *testing.T) {
 func TestLateRawPacketRecoversTheFlow(t *testing.T) {
 	h := newFlowHarness(t)
 	f := h.flow
+	f.confirmedRaw.Store(true) // a real flow reached raw before entering backoff
 	go f.readRaw()
 	// A flow waiting out a backoff, with no probe due for a long time.
 	f.writeMu.Lock()
@@ -407,5 +408,53 @@ func TestLateRawPacketRecoversTheFlow(t *testing.T) {
 	h.expectRaw(t, shortPacket)
 	if c := f.diagnostic.counters.snapshot(); c.RawActivations != 1 || c.RawTxPackets != 1 {
 		t.Fatalf("counters %+v", c)
+	}
+}
+
+func TestRawActivationRejectsUnknownCID(t *testing.T) {
+	h := newFlowHarness(t)
+	f := h.flow
+	clientCID := []byte("client01")
+	initial := append([]byte{0xc0, 0, 0, 0, 1, 1, 's', byte(len(clientCID))}, clientCID...)
+	if _, err := f.write(initial); err != nil {
+		t.Fatal(err)
+	}
+	h.frame(t)
+	go f.readRaw()
+
+	// A 42-byte short-header packet is what the shared HY2 listener sends as
+	// a stateless reset for an unclaimed raw probe. Its random CID must not
+	// activate raw even though the source address and short header match.
+	reset := make([]byte, 42)
+	reset[0] = 0x40
+	copy(reset[1:], "unknown1")
+	if _, err := h.relay.WriteTo(reset, f.raw.pc.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(time.Second); ; {
+		if f.diagnostic.counters.snapshot().RawDropped == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("unknown-CID raw reply was not dropped")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if f.active.Load() || f.confirmedRaw.Load() {
+		t.Fatal("stateless reset activated raw")
+	}
+
+	reply := append(append([]byte{0x40}, clientCID...), 1)
+	if _, err := h.relay.WriteTo(reply, f.raw.pc.LocalAddr()); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(time.Second); !f.active.Load(); {
+		if time.Now().After(deadline) {
+			t.Fatal("matching client CID did not activate raw")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if c := f.diagnostic.counters.snapshot(); c.RawActivations != 1 || c.RawRxPackets != 1 || c.RawDropped != 1 {
+		t.Fatalf("unexpected counters after valid reply: %+v", c)
 	}
 }

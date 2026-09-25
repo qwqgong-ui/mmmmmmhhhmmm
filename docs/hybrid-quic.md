@@ -36,7 +36,10 @@ Only public UDP 443 targets beginning with a QUIC Initial use hybrid. Other UDP
 uses the node's native datagram support. Fake-IP names stay names until the
 terminal resolves them. DNS mapping/hosts mode retains a selected real IP.
 
-A successful raw reply activates raw. A probe timeout, or 15 seconds without a
+A raw reply activates raw only when its destination connection ID matches one
+observed in the client's long-header packets. This prevents a shared HY2
+listener's stateless reset from making an unclaimed probe look successful. A
+probe timeout, or 15 seconds without a
 raw reply, returns both directions to the stream; the timeout also applies to
 idle raw flows. That is not the end of raw. A flow that was carrying nothing
 when raw went quiet keeps its binding and probes again on its next packet; one
