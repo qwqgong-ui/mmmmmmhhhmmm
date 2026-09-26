@@ -41,6 +41,7 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 		return nil, err
 	}
 	defer conn.Close()
+	logDNSSocket("connected", conn, m, nil, nil)
 
 	// miekg/dns ExchangeContext doesn't respond to context cancel.
 	// this is a workaround
@@ -60,6 +61,7 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 		}
 
 		msg, _, err := dClient.ExchangeWithConn(m, dConn)
+		logDNSSocket("response", conn, m, msg, err)
 
 		// Resolvers MUST resend queries over TCP if they receive a truncated UDP response (with TC=1 set)!
 		if msg != nil && msg.Truncated && network == "udp" {
