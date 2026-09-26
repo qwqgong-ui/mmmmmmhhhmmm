@@ -37,6 +37,11 @@ func (h *ListenerHandler) NewConnection(ctx context.Context, conn net.Conn, meta
 
 func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buffer *buf.Buffer, metadata M.Metadata, init func(natConn network.PacketConn) network.PacketWriter) {
 	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+		if resolver.IsDNSUpstream(metadata.Source.AddrPort(), metadata.Destination.AddrPort()) {
+			log.Debugln("[DNS] drop recirculated upstream query udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
+			buffer.Release()
+			return
+		}
 		log.Debugln("[DNS] hijack udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
 		writer := init(nil)
 		rwOptions := network.ReadWaitOptions{
@@ -52,6 +57,10 @@ func (h *ListenerHandler) NewPacket(ctx context.Context, key netip.AddrPort, buf
 
 func (h *ListenerHandler) NewPacketConnection(ctx context.Context, conn network.PacketConn, metadata M.Metadata) error {
 	if h.ShouldHijackDns(metadata.Destination.AddrPort()) {
+		if resolver.IsDNSUpstream(metadata.Source.AddrPort(), metadata.Destination.AddrPort()) {
+			log.Debugln("[DNS] drop recirculated upstream query udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
+			return conn.Close()
+		}
 		log.Debugln("[DNS] hijack udp:%s from %s", metadata.Destination.String(), metadata.Source.String())
 		defer func() { _ = conn.Close() }()
 		mutex := sync.Mutex{}

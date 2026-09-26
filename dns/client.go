@@ -41,6 +41,9 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 		return nil, err
 	}
 	defer conn.Close()
+	if network == "udp" {
+		defer resolver.TrackDNSUpstream(conn)()
+	}
 	logDNSSocket("connected", conn, m, nil, nil)
 
 	// miekg/dns ExchangeContext doesn't respond to context cancel.
