@@ -411,6 +411,46 @@ func TestLateRawPacketRecoversTheFlow(t *testing.T) {
 	}
 }
 
+func TestZeroClientCIDStaysOnStream(t *testing.T) {
+	h := newFlowHarness(t)
+	f := h.flow
+	// Chrome can choose no client CID, despite the server CID being nonempty.
+	initial := []byte{0xc0, 0, 0, 0, 1, 8, 's', 'e', 'r', 'v', 'e', 'r', '0', '1', 0}
+	if _, err := f.write(initial); err != nil {
+		t.Fatal(err)
+	}
+	if frame := h.frame(t); len(frame) != 0 {
+		t.Fatalf("expected raw-disable control, got %x", frame)
+	}
+	if frame := h.frame(t); string(frame) != string(initial) {
+		t.Fatalf("initial changed: %x", frame)
+	}
+	// Repeated long headers and subsequent short headers must not restart a
+	// probe or produce another control frame, including after a retry deadline.
+	f.retryAt = time.Now().Add(-time.Hour)
+	for _, packet := range [][]byte{initial, shortPacket, shortPacket} {
+		if _, err := f.write(packet); err != nil {
+			t.Fatal(err)
+		}
+		if frame := h.frame(t); string(frame) != string(packet) {
+			t.Fatalf("stream packet changed: %x, want %x", frame, packet)
+		}
+	}
+	if _, _, reason, permanent := h.state(t); reason != "zero_client_cid" || !permanent {
+		t.Fatalf("reason=%q permanent=%v", reason, permanent)
+	}
+	if c := f.diagnostic.counters.snapshot(); c.RawTxPackets != 0 || c.StreamTxPackets != 4 {
+		t.Fatalf("zero-CID flow attempted raw: %+v", c)
+	}
+	if !f.disabled.Load() || f.active.Load() || !f.probeEnd.IsZero() {
+		t.Fatal("zero-CID flow retained a raw probe")
+	}
+	h.relay.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	if _, _, err := h.relay.ReadFrom(make([]byte, 128)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("unexpected raw packet or error: %v", err)
+	}
+}
+
 func TestRawActivationRejectsUnknownCID(t *testing.T) {
 	h := newFlowHarness(t)
 	f := h.flow
@@ -420,6 +460,14 @@ func TestRawActivationRejectsUnknownCID(t *testing.T) {
 		t.Fatal(err)
 	}
 	h.frame(t)
+	// A nonempty client CID still permits probing, unlike the zero-CID case.
+	if _, err := f.write(shortPacket); err != nil {
+		t.Fatal(err)
+	}
+	if frame := h.frame(t); string(frame) != string(shortPacket) {
+		t.Fatalf("probe lost its stream copy: %x", frame)
+	}
+	h.expectRaw(t, shortPacket)
 	go f.readRaw()
 
 	// A 42-byte short-header packet is what the shared HY2 listener sends as

@@ -294,8 +294,21 @@ func (f *clientFlow) idleFor(now time.Time) time.Duration {
 func (f *clientFlow) write(p []byte) (int, error) {
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
-	if _, scid, ok := LongCIDs(p); ok && scid != "" {
-		f.rememberClientCID(scid)
+	if _, scid, ok := LongCIDs(p); ok {
+		if scid == "" {
+			// A zero-length client CID leaves no identity to authenticate the
+			// first raw reply against. Probing anyway lets the relay switch
+			// downstream to raw while readRaw drops every reply until timeout.
+			// Keep this flow on the stream; accepting an empty CID as a
+			// wildcard would also accept the shared listener's stateless reset.
+			if !f.disabled.Load() {
+				if err := f.disableLocked(true, "zero_client_cid"); err != nil {
+					return 0, err
+				}
+			}
+		} else {
+			f.rememberClientCID(scid)
+		}
 	}
 	now := time.Now()
 	raw, probe := false, false
