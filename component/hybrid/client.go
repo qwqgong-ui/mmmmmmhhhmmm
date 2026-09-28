@@ -77,6 +77,12 @@ type clientFlow struct {
 	retries             int       // recoverable fallbacks charged so far, protected by writeMu
 	done                chan struct{}
 	diagnostic          *flowDiagnostic
+	lease               bool
+	leaseUntil          atomic.Int64
+	leaseSeq            uint64
+	leaseSent           time.Time
+	leaseNext           time.Time
+	leaseProbe          []byte
 }
 type result struct {
 	p      []byte
@@ -135,7 +141,9 @@ func (c *PacketConn) WriteTo(p []byte, a net.Addr) (int, error) {
 		return 0, net.ErrClosed
 	}
 	if f.err != nil {
-		return c.writeFallback(p, a)
+		// A hybrid flow requires registration at the reserved endpoint. Never
+		// bypass a rejected registration through native UDP.
+		return 0, f.err
 	}
 	return f.write(p)
 }
@@ -161,7 +169,8 @@ func (f *clientFlow) open(address string) {
 		close(f.ready)
 	}
 	stream.SetDeadline(time.Now().Add(10 * time.Second))
-	if err = WriteRequest(stream, Request{Target: address}); err != nil {
+	f.lease = true
+	if err = WriteRequest(stream, Request{Target: address, Lease: true}); err != nil {
 		fail(err)
 		return
 	}
@@ -225,7 +234,7 @@ func (f *clientFlow) open(address string) {
 	f.diagnostic.setRawConnected(f.raw != nil && f.raw.connected())
 	f.diagnostic.update("tunnel", f.relay.String(), "", false, false)
 	if log.Enabled(log.DEBUG) {
-		log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "hqs1_registered", "flow_id": f.diagnostic.FlowID, "host": address}, "HQS1 registered target=%s raw_endpoint=%s", f.target, f.relay)
+		log.Fields(log.DEBUG, map[string]string{"subsystem": "hybrid", "event": "hqs2_registered", "flow_id": f.diagnostic.FlowID, "host": address}, "HQS2 registered target=%s raw_endpoint=%s", f.target, f.relay)
 	}
 	close(f.ready)
 	go f.readStream()
@@ -248,6 +257,8 @@ func (f *clientFlow) disable(notify bool, reason string) error {
 func (f *clientFlow) disableLocked(notify bool, reason string) error {
 	f.disabled.Store(true)
 	f.active.Store(false)
+	f.leaseUntil.Store(0)
+	f.leaseProbe = nil
 	f.diagnostic.countOne(rawFallbacks)
 	f.diagnostic.update("tunnel", "", reason, false, true)
 	if notify {
@@ -263,12 +274,20 @@ func (f *clientFlow) disableLocked(notify bool, reason string) error {
 // longer after each attempt, and finally gives up for good.
 func (f *clientFlow) fallbackLocked(now time.Time, reason string) error {
 	f.active.Store(false)
+	f.leaseUntil.Store(0)
+	f.leaseProbe = nil
+	if f.lease {
+		f.leaseSeq++
+	}
 	f.lastRaw.Store(0)
 	f.probeEnd, f.nextProbe = time.Time{}, time.Time{}
 	if reason == "raw_silence" && f.idleFor(now) >= rawSilence {
 		f.retryAt = time.Time{}
 		f.diagnostic.countOne(rawFallbacks)
 		f.diagnostic.update("tunnel", "", "raw_idle", false, false)
+		if f.lease {
+			return WriteFrame(f.stream, nil)
+		}
 		return nil
 	}
 	f.retries++
@@ -295,7 +314,7 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	f.writeMu.Lock()
 	defer f.writeMu.Unlock()
 	if _, scid, ok := LongCIDs(p); ok {
-		if scid == "" {
+		if scid == "" && !f.lease {
 			// A zero-length client CID leaves no identity to authenticate the
 			// first raw reply against. Probing anyway lets the relay switch
 			// downstream to raw while readRaw drops every reply until timeout.
@@ -306,11 +325,16 @@ func (f *clientFlow) write(p []byte) (int, error) {
 					return 0, err
 				}
 			}
-		} else {
+		} else if scid != "" {
 			f.rememberClientCID(scid)
 		}
 	}
 	now := time.Now()
+	if f.lease && f.active.Load() && now.UnixNano() >= f.leaseUntil.Load() {
+		if err := f.fallbackLocked(now, "lease_expired"); err != nil {
+			return 0, err
+		}
+	}
 	raw, probe := false, false
 	if !f.disabled.Load() && Short(p) {
 		if f.active.Load() {
@@ -321,7 +345,7 @@ func (f *clientFlow) write(p []byte) (int, error) {
 			} else {
 				raw = true
 			}
-		} else if !now.Before(f.retryAt) {
+		} else if !now.Before(f.retryAt) && (!f.lease || f.leaseUntil.Load() == 0) {
 			if f.probeEnd.IsZero() {
 				f.probeEnd = now.Add(probeTimeout)
 			}
@@ -345,6 +369,11 @@ func (f *clientFlow) write(p []byte) (int, error) {
 			return 0, err
 		}
 	}
+	if probe && f.lease {
+		if err := f.requestLeaseLocked(p, now); err != nil {
+			return 0, err
+		}
+	}
 	if err := WriteFrame(f.stream, p); err != nil {
 		return 0, err
 	}
@@ -352,12 +381,16 @@ func (f *clientFlow) write(p []byte) (int, error) {
 	f.diagnostic.touch(now)
 	if probe {
 		f.diagnostic.update("probing", f.relay.String(), "", true, false)
-		if _, err := f.raw.write(p); err != nil {
+		probePacket := p
+		if f.lease {
+			probePacket = f.leaseProbe
+		}
+		if _, err := f.raw.write(probePacket); err != nil {
 			if err = f.disableLocked(true, "probe_write_error"); err != nil {
 				return 0, err
 			}
 		} else {
-			f.diagnostic.count(rawTxPackets, rawTxBytes, len(p))
+			f.diagnostic.count(rawTxPackets, rawTxBytes, len(probePacket))
 		}
 	}
 	return len(p), nil
@@ -397,10 +430,17 @@ func (f *clientFlow) readStream() {
 		}
 	}()
 	for {
-		p, err := ReadFrame(f.stream)
+		p, control, err := readRecord(f.stream)
 		if err != nil {
 			f.owner.deliver(result{err: err})
 			return
+		}
+		if control != nil {
+			if err := f.acceptLease(*control); err != nil {
+				f.owner.deliver(result{err: err})
+				return
+			}
+			continue
 		}
 		if p == nil {
 			continue
@@ -449,8 +489,15 @@ func (f *clientFlow) readRaw() {
 		// An unclaimed probe on a shared HY2 listener can elicit a QUIC
 		// stateless reset: it has a short header and comes from the relay,
 		// but its random destination CID is not one the client advertised.
-		if !f.confirmedRaw.Load() && !f.matchesClientCID(b[:n]) {
+		if (f.lease && time.Now().UnixNano() >= f.leaseUntil.Load()) || (!f.lease && !f.confirmedRaw.Load() && !f.matchesClientCID(b[:n])) {
 			f.diagnostic.countOne(rawDropped)
+			continue
+		}
+		if f.lease && !f.active.Load() {
+			if err := f.confirmLeasePacket(b[:n]); err != nil {
+				f.stream.Close()
+				return
+			}
 			continue
 		}
 		now := time.Now()
@@ -624,7 +671,17 @@ func (f *clientFlow) watch() {
 		case now := <-ticker.C:
 			f.writeMu.Lock()
 			var err error
-			if !f.disabled.Load() {
+			if f.lease && !f.disabled.Load() && f.leaseUntil.Load() != 0 {
+				if now.UnixNano() >= f.leaseUntil.Load() {
+					err = f.fallbackLocked(now, "lease_expired")
+				} else if f.active.Load() && !now.Before(f.leaseNext) {
+					f.leaseSeq++
+					f.leaseSent = now
+					f.leaseNext = now.Add(10 * time.Second)
+					err = writeLease(f.stream, leaseControl{kind: leaseRenew, seq: f.leaseSeq})
+				}
+			}
+			if err == nil && !f.disabled.Load() {
 				if f.active.Load() {
 					if last := f.lastRaw.Load(); last != 0 && now.UnixNano()-last >= int64(rawSilence) {
 						err = f.fallbackLocked(now, "raw_silence")
