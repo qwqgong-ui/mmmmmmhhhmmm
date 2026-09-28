@@ -40,8 +40,11 @@ HQS2 registers a one-use SHA-256 digest of a real probe packet on the reliable
 `hybrid-quic.invalid:443` stream. The terminal matches the unchanged raw packet
 and authenticated origin IP, then binds the observed UDP source address and port.
 The probe is already delivered on the stream and is not forwarded twice.
-Before activation the terminal mirrors real downstream QUIC packets over raw
-and the stream. The client reports a digest only after receiving a raw copy;
+Before activation the terminal selects one real downstream QUIC packet as a
+fixed reverse-path proof, retransmitted over raw at most once every 250 ms.
+Application data continues over the stream; a burst cannot evict the proof or
+duplicate the whole download. Pause or confirmation timeout stops these copies.
+The client reports a digest only after receiving a raw copy;
 the terminal checks that proof before acknowledging bidirectional activation.
 Zero-length CIDs use the same binding, with no UDP wrapper or marker.
 Only this reserved endpoint can register a hybrid flow; registration rejection
