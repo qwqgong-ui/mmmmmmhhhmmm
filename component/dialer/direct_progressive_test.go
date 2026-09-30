@@ -28,6 +28,38 @@ func (r *progressiveTestResolver) PromoteIP(_ string, _ bool, _ string, ip netip
 	r.promoted <- ip.Unmap()
 }
 
+func TestProgressiveDirectSingleCachedWinnerPreservesTFO(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	previous := GetTcpConcurrent()
+	SetTcpConcurrent(true)
+	t.Cleanup(func() { SetTcpConcurrent(previous) })
+	ip := netip.MustParseAddr("192.0.2.1")
+	key := mustTCPConcurrentCacheKey(t, "cached.example", "443", "tcp")
+	cache.SetWithRTT(key, ip, 20*time.Millisecond)
+	v4 := make(chan R.IPCandidateBatch, 1)
+	v4 <- R.IPCandidateBatch{IPs: []netip.Addr{ip}}
+	close(v4)
+	v6 := make(chan R.IPCandidateBatch)
+	close(v6)
+	r := &progressiveTestResolver{v4: v4, v6: v6, promoted: make(chan netip.Addr, 2)}
+	conn, err := directProgressiveDialContext(context.Background(), "tcp", "cached.example:443", option{tfo: true}, r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	if _, ok := conn.(*tfoConn); !ok {
+		t.Fatalf("connection = %T; want lazy TFO", conn)
+	}
+	if rtt, loaded := cache.RTT(key); !loaded || rtt != 20*time.Millisecond {
+		t.Fatalf("RTT = %s, %v; lazy TFO must preserve the measured RTT", rtt, loaded)
+	}
+	select {
+	case <-r.promoted:
+		t.Fatal("lazy TFO must not promote an unmeasured destination")
+	default:
+	}
+}
+
 func TestProgressiveDirectReturnsFirstDNSRaceAndAcceptsLaterFasterSource(t *testing.T) {
 	ClearTCPConcurrentCache()
 	t.Cleanup(ClearTCPConcurrentCache)

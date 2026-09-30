@@ -226,6 +226,7 @@ func runProgressiveDirectRace(
 		pendingFamily[family]++
 		go func() {
 			connectOpt := opt
+			// Further DNS batches and the other family can join this race.
 			connectOpt.tfo = false
 			started := time.Now()
 			conn, err := dialContext(ctx, network, ip, port, connectOpt)
@@ -273,6 +274,13 @@ func runProgressiveDirectRace(
 	// an expired budget releases the remaining candidates without destroying
 	// connects that may still be about to complete.
 	startFastGroup := func(winners []tcpConcurrentWinner, ipv6 bool) {
+		connectOpt := opt
+		// Other candidates remain queued until this group fails or times out.
+		// Only a group with multiple winners is itself a race.
+		if len(winners) > 1 {
+			connectOpt.tfo = false
+		}
+		measureLatency := !tfoDialIsAsynchronous(connectOpt)
 		fastPriority = true
 		fastInFlight = fastInFlight[:0]
 		budget := time.Duration(0)
@@ -290,16 +298,16 @@ func runProgressiveDirectRace(
 			pending++
 			pendingFamily[family]++
 			go func() {
-				connectOpt := opt
-				connectOpt.tfo = false
 				started := time.Now()
 				conn, err := dialContext(ctx, network, winner.IP, port, connectOpt)
 				logDirectAttempt(host, port, scope, winner.IP, time.Since(started), err, true)
 				result := progressiveConnectResult{
 					dialResult: dialResult{ip: winner.IP, Conn: conn, error: err},
 					ipv6:       ipv6,
-					rtt:        measuredDialDuration(started),
 					fast:       true,
+				}
+				if measureLatency {
+					result.rtt = measuredDialDuration(started)
 				}
 				select {
 				case connects <- result:

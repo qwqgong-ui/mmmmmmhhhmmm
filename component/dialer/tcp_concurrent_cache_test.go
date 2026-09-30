@@ -580,8 +580,7 @@ func TestParallelDialContextRacesWithoutTFOAndMeasuresRTT(t *testing.T) {
 	})
 	time.AfterFunc(20*time.Millisecond, func() { close(slow) })
 
-	// Racing more than one candidate must ignore opt.tfo and still produce a
-	// real, positive RTT sample, just like the single-candidate fast path.
+	// Racing more than one candidate must produce a real, positive RTT sample.
 	result := parallelDialContext(context.Background(), "tcp", []netip.Addr{ipA, ipB}, "443", option{netDialer: dialer, tfo: true})
 	if result.error != nil || result.ip != ipA {
 		t.Fatalf("result = %s, %v; want %s, nil", result.ip, result.error, ipA)
@@ -595,21 +594,18 @@ func TestParallelDialContextRacesWithoutTFOAndMeasuresRTT(t *testing.T) {
 	}
 }
 
-func TestParallelDialContextSingleIPDisablesTFO(t *testing.T) {
+func TestParallelDialContextSingleIPPreservesTFO(t *testing.T) {
 	ip := netip.MustParseAddr("192.0.2.1")
-	slow := make(chan struct{})
-	time.AfterFunc(20*time.Millisecond, func() { close(slow) })
-	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
-		ip: {{release: slow}},
-	})
-
-	result := parallelDialContext(context.Background(), "tcp", []netip.Addr{ip}, "443", option{netDialer: dialer, tfo: true})
+	result := parallelDialContext(context.Background(), "tcp", []netip.Addr{ip}, "443", option{tfo: true})
 	if result.error != nil {
 		t.Fatalf("result error = %v", result.error)
 	}
 	_ = result.Conn.Close()
-	if result.dialDuration < 15*time.Millisecond {
-		t.Fatalf("dialDuration = %s; want real handshake timing despite opt.tfo", result.dialDuration)
+	if _, ok := result.Conn.(*tfoConn); !ok {
+		t.Fatalf("connection = %T; want lazy TFO", result.Conn)
+	}
+	if result.dialDuration != 0 {
+		t.Fatalf("dialDuration = %s; lazy TFO has no RTT sample", result.dialDuration)
 	}
 }
 
@@ -640,24 +636,102 @@ func TestTCPConcurrentDialContextRacesWithoutTFOAndRecordsRTT(t *testing.T) {
 	}
 }
 
-func TestTCPConcurrentFastPathDisablesTFO(t *testing.T) {
+func TestTCPConcurrentFastPathPreservesTFO(t *testing.T) {
 	cache := installTestTCPConcurrentCache(t)
 	ipA := netip.MustParseAddr("192.0.2.1")
 	ipB := netip.MustParseAddr("192.0.2.2")
 	key := mustTCPConcurrentCacheKey(t, "example.test", "443", "tcp")
-	cache.Set(key, ipB)
-	dialer := newTestTCPDialer(map[netip.Addr][]testDialBehavior{
-		ipA: {{release: closedTestGate()}},
-		ipB: {{release: closedTestGate()}},
-	})
+	cache.SetWithRTT(key, ipB, 20*time.Millisecond)
 
-	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB}, "443", option{netDialer: dialer, tfo: true}, parallelDialContext)
+	result := tcpConcurrentDialContext(context.Background(), "tcp", "example.test", []netip.Addr{ipA, ipB}, "443", option{tfo: true}, parallelDialContext)
 	if result.error != nil || result.ip != ipB {
 		t.Fatalf("fast-path result = %s, %v; want %s, nil", result.ip, result.error, ipB)
 	}
 	_ = result.Conn.Close()
-	if rtt, loaded := cache.RTT(key); !loaded || rtt <= 0 {
-		t.Fatal("fast-path must record a real RTT despite opt.tfo")
+	if _, ok := result.Conn.(*tfoConn); !ok {
+		t.Fatalf("connection = %T; want lazy TFO", result.Conn)
+	}
+	if rtt, loaded := cache.RTT(key); !loaded || rtt != 20*time.Millisecond {
+		t.Fatalf("RTT = %s, %v; lazy TFO must preserve the measured RTT", rtt, loaded)
+	}
+}
+
+func TestTCPConcurrentSingleCandidatePreservesTFO(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	ip := netip.MustParseAddr("192.0.2.1")
+	result := tcpConcurrentDialContext(context.Background(), "tcp", "single.example", []netip.Addr{ip}, "443", option{tfo: true}, parallelDialContext)
+	if result.error != nil {
+		t.Fatal(result.error)
+	}
+	defer result.Conn.Close()
+	if _, ok := result.Conn.(*tfoConn); !ok {
+		t.Fatalf("connection = %T; want lazy TFO", result.Conn)
+	}
+	key := mustTCPConcurrentCacheKey(t, "single.example", "443", "tcp")
+	if _, loaded := cache.Get(key); !loaded {
+		t.Fatal("missing retained destination")
+	}
+	if _, loaded := cache.RTT(key); loaded {
+		t.Fatal("lazy TFO must not create an RTT sample")
+	}
+}
+
+func TestDirectLiteralPreservesTFO(t *testing.T) {
+	previous := GetTcpConcurrent()
+	t.Cleanup(func() { SetTcpConcurrent(previous) })
+	for _, concurrent := range []bool{false, true} {
+		SetTcpConcurrent(concurrent)
+		conn, err := DialContext(context.Background(), "tcp", "192.0.2.1:443", WithTFO(true), WithDirectDualStack())
+		if err != nil {
+			t.Fatal(err)
+		}
+		conn.Close()
+		if _, ok := conn.(*tfoConn); !ok {
+			t.Fatalf("concurrent=%v: connection = %T; want lazy TFO", concurrent, conn)
+		}
+	}
+}
+
+func TestDualStackRaceDisablesTFOForSingleAddressFamilies(t *testing.T) {
+	ips := []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("2001:db8::1")}
+	dial := func(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult {
+		if opt.tfo {
+			return dialResult{error: errors.New("TFO enabled during family race")}
+		}
+		client, peer := net.Pipe()
+		peer.Close()
+		return dialResult{Conn: client, ip: ips[0]}
+	}
+	result := dualStackDialContext(context.Background(), dial, "tcp", ips, "443", option{tfo: true})
+	if result.error != nil {
+		t.Fatal(result.error)
+	}
+	result.Conn.Close()
+}
+
+func TestTCPConcurrentMultipleCachedWinnersDisableTFO(t *testing.T) {
+	cache := installTestTCPConcurrentCache(t)
+	listener, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+	_, port, _ := net.SplitHostPort(listener.Addr().String())
+	ips := []netip.Addr{netip.MustParseAddr("127.0.0.1"), netip.MustParseAddr("127.0.0.2")}
+	key := mustTCPConcurrentCacheKey(t, "race.example", port, "tcp")
+	for _, ip := range ips {
+		cache.SetWithRTT(key, ip, 20*time.Millisecond)
+	}
+	result := tcpConcurrentDialContext(context.Background(), "tcp", "race.example", ips, port, option{tfo: true}, parallelDialContext)
+	if result.error != nil {
+		t.Fatal(result.error)
+	}
+	defer result.Conn.Close()
+	if _, ok := result.Conn.(*tfoConn); ok {
+		t.Fatal("cached race returned an unconnected TFO stub")
+	}
+	if result.ip != ips[0] || result.dialDuration <= 0 {
+		t.Fatalf("winner = %s, RTT = %s; want the reachable address and a measured RTT", result.ip, result.dialDuration)
 	}
 }
 

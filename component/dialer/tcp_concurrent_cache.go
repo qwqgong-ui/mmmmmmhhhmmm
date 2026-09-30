@@ -477,16 +477,14 @@ func containsTCPConcurrentCandidate(candidates []netip.Addr, winner netip.Addr) 
 }
 
 func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []netip.Addr, port string, opt option, fallback dialFunc) dialResult {
-	// Cached and single-candidate paths still require a real TCP handshake.
-	opt.tfo = false
 	key, cacheable := tcpConcurrentPathKey(host, port, network, directNetworkScope(opt), opt)
 	if !cacheable {
 		return fallback(ctx, network, ips, port, opt)
 	}
 
-	// Each cached winner still named by the current answer gets its own
-	// budget, in order, before the full race starts. One withdrawn CDN node
-	// then costs a single extra connect instead of a restart from scratch.
+	// Try the retained destinations still named by DNS under one shared budget
+	// before the full race. A single destination keeps TFO; multiple retained
+	// destinations race with synchronous handshakes.
 	winners, loaded := tcpConcurrentCache.Winners(key)
 	if loaded {
 		diagstats.Add(diagstats.DirectWinnerHit)
@@ -502,9 +500,15 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 		}
 	}
 	if len(winners) > 0 {
+		fastOpt := opt
+		// A single retained destination does not race; preserve its TFO option.
+		// Multiple retained winners must complete real handshakes to compete.
+		if len(winners) > 1 {
+			fastOpt.tfo = false
+		}
+		measureLatency := !tfoDialIsAsynchronous(fastOpt)
 		fastCtx, cancelFast := context.WithCancel(ctx)
 		fastResult := make(chan dialResult, len(winners))
-		fastStart := time.Now()
 		budget := time.Duration(0)
 		for _, winner := range winners {
 			// One shared budget covering the group follows its slowest
@@ -514,7 +518,11 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 			cachedIP := winner.IP
 			go func() {
 				result := dialResult{ip: cachedIP}
-				result.Conn, result.error = dialContext(fastCtx, network, cachedIP, port, opt)
+				started := time.Now()
+				result.Conn, result.error = dialContext(fastCtx, network, cachedIP, port, fastOpt)
+				if measureLatency {
+					result.dialDuration = measuredDialDuration(started)
+				}
 				select {
 				case fastResult <- result:
 				case <-fastCtx.Done():
@@ -543,7 +551,7 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 				if result.error == nil {
 					stopFastTimer()
 					cancelFast()
-					tcpConcurrentCache.SetWithRTT(key, result.ip, measuredDialDuration(fastStart))
+					tcpConcurrentCache.SetWithRTT(key, result.ip, result.dialDuration)
 					return result
 				}
 				if ctx.Err() != nil {

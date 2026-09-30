@@ -53,6 +53,7 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 
 	if isTCPNetwork(network) && opt.directRace {
 		host, _, splitErr := net.SplitHostPort(address)
+		_, literalErr := netip.ParseAddr(host)
 		if splitErr == nil && canUseProgressiveDirect(host) {
 			preferResolver := opt.resolver
 			if preferResolver == nil {
@@ -63,7 +64,9 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 				return directProgressiveDialContext(ctx, network, address, opt, progressive)
 			}
 		}
-		if network == "tcp" && !GetTcpConcurrent() {
+		// Literal destinations use the ordinary single-address path below;
+		// they have no DNS or address-family race requiring TFO suppression.
+		if network == "tcp" && !GetTcpConcurrent() && literalErr != nil {
 			return directDualStackDialContext(ctx, network, address, opt)
 		}
 	}
@@ -581,7 +584,15 @@ func listenConfig(network, address string, rAddrPort netip.AddrPort, opt option)
 // measures stub construction, not network latency, and must not be used as
 // an RTT sample (see tcpConcurrentDialContext and parallelDialContext).
 func tfoDialIsAsynchronous(opt option) bool {
-	return DefaultSocketHook == nil && opt.tfo && !DisableTFO
+	if DefaultSocketHook != nil || !opt.tfo || DisableTFO {
+		return false
+	}
+	switch opt.netDialer.(type) {
+	case nil, *net.Dialer:
+		return true
+	default:
+		return false // Custom dialers bypass dialTFO in dialContext.
+	}
 }
 
 // joinAddrPort formats destination:port the same way
@@ -717,6 +728,9 @@ func dualStackDialContext(ctx context.Context, dialFn dialFunc, network string, 
 	if len(ipv4s) != 0 && len(ipv6s) == 0 {
 		return dialFn(ctx, network, ipv4s, port, opt)
 	}
+	// Both families compete, even if each contains only one address.
+	// Lazy TFO must not report a winner before either handshake completes.
+	opt.tfo = false
 
 	preferIPVersion := opt.prefer
 	fallbackTicker := time.NewTicker(dualStackFallbackTimeout)
@@ -799,19 +813,15 @@ loop:
 }
 
 func parallelDialContext(ctx context.Context, network string, ips []netip.Addr, port string, opt option) dialResult {
-	// Concurrent dialing requires a completed handshake even if DNS currently
-	// names only one candidate. Lazy TFO success cannot supply a winner or RTT.
-	opt.tfo = false
 	if len(ips) == 0 {
 		return dialResult{error: ErrorNoIpAddress}
 	}
 	if len(ips) == 1 {
-		start := time.Now()
-		result := dialResult{ip: ips[0]}
-		result.Conn, result.error = dialContext(ctx, network, ips[0], port, opt)
-		result.dialDuration = measuredDialDuration(start)
-		return result
+		return serialDialContext(ctx, network, ips, port, opt)
 	}
+	// Only competing candidates require synchronous handshakes. A single
+	// destination keeps TFO, whose lazy dial must not be timed as an RTT.
+	opt.tfo = false
 
 	results := make(chan dialResult)
 	returned := make(chan struct{})
