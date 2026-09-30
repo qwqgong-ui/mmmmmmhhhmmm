@@ -508,7 +508,9 @@ func tcpConcurrentDialContext(ctx context.Context, network, host string, ips []n
 		}
 		measureLatency := !tfoDialIsAsynchronous(fastOpt)
 		fastCtx, cancelFast := context.WithCancel(ctx)
-		fastResult := make(chan dialResult, len(winners))
+		// Transfer ownership only while the race is receiving. Once it exits,
+		// cancellation makes every unclaimed successful attempt close its socket.
+		fastResult := make(chan dialResult)
 		budget := time.Duration(0)
 		for _, winner := range winners {
 			// One shared budget covering the group follows its slowest

@@ -461,6 +461,10 @@ func runProgressiveDirectRace(
 				// because a black hole never reports an error to remove it.
 				log.Debugln("[TCP] progressive direct cached connect ready %s:%s --> %s in %s", host, port, result.ip, result.rtt)
 				promote(result)
+				if heldFallback != nil {
+					_ = heldFallback.Close()
+					heldFallback = nil
+				}
 				deliver(result.Conn, result.ip)
 				continue
 			}
