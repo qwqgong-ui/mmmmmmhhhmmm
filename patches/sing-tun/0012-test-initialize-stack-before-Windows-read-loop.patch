@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: qwqgong-ui <noreply@qwqgong-ui.local>
+Subject: [PATCH] test: initialize stack before Windows read loop
+
+sing-tun v0.4.27 configures RX checksum offload when entering readLoop.
+The Windows read-failure fixture bypasses Start and left s.stack nil.
+Give the fixture an initialized stack so it still tests device read failure
+instead of panicking before the read. Production code is unchanged.
+
+diff --git a/stack_mipstack_io_test.go b/stack_mipstack_io_test.go
+--- a/stack_mipstack_io_test.go
++++ b/stack_mipstack_io_test.go
+@@ -369,7 +369,12 @@ func TestMipsWindowsReadFailureExitsReadLoop(t *testing.T) {
+ 	}
+ 	t.Cleanup(func() { _ = d.Close() })
+-	s := &Mipstack{tun: d, logger: logger.NOP()}
++	stack, err := mipstack.New(mipstack.Config{LocalAddresses: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")}})
++	if err != nil {
++		t.Fatal(err)
++	}
++	t.Cleanup(func() { _ = stack.Close() })
++	s := &Mipstack{tun: d, stack: stack, logger: logger.NOP()}
+ 	done := make(chan struct{})
+ 	go func() { s.readLoop(); close(done) }()
+ 	select {
+ 	case <-done:

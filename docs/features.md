@@ -7,8 +7,9 @@
 Mihomo 补丁已在
 2026-08-26 完整展开到 `dev` 源码，不再需要构建前应用 `patches/mihomo/series`。
 各功能文档中的 `Patches` 列表仅保留为迁移前的源码分组索引，实际实现以
-`dev` 分支中的 Go 源码和测试为准。quic-go、sing-quic、sing-tun 和 sing-mux 仍是外部
-Go module，因此它们的补丁继续保存在 `patches/` 下并由构建流程应用。
+`dev` 分支中的 Go 源码和测试为准。quic-go、sing-quic、sing-tun 的外部模块补丁
+继续保存在 `patches/` 下并由构建流程应用。sing-mux v0.3.12 已包含 h2mux 修复，
+sing-tun v0.4.27 已包含 ICMP 活跃时间修复，对应重复补丁已移除。
 
 ## 功能目录
 

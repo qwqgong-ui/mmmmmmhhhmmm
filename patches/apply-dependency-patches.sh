@@ -57,11 +57,6 @@ apply_module_patches \
 	"$repo_root/patches/sing-tun" \
 	sing-tun
 
-apply_module_patches \
-	github.com/metacubex/sing-mux \
-	"$repo_root/patches/sing-mux" \
-	sing-mux
-
 if [ "$#" -gt 0 ]; then
 	printf 'GOFLAGS=-modfile=%s\n' "$modfile" >> "$1"
 else

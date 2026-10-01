@@ -2,7 +2,8 @@
 
 [返回功能目录](../features.md) · [配置示例](../config.yaml)
 
-只改依赖 `github.com/metacubex/sing-mux`，补丁在 `patches/sing-mux/`。
+依赖 `github.com/metacubex/sing-mux` v0.3.12 已包含此修复，不再应用本地补丁。
+以下保留原问题与修复原因。
 
 x/net **v0.54.0** 起 `x/net/http2` 在 **Go 1.27 工具链**下会走 net/http 的请求
 校验（`//go:build go1.27 && !http2legacy`），而 sing-mux 的 h2mux 客户端为每条

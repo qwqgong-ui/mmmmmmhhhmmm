@@ -28,7 +28,7 @@ diff --git a/ping/destination.go b/ping/destination.go
 index cb3cd20..1791ee4 100644
 --- a/ping/destination.go
 +++ b/ping/destination.go
-@@ -142,23 +142,31 @@ func (d *Destination) loopRead() {
+@@ -153,24 +153,32 @@ func (d *Destination) loopRead() {
  			}
  			icmpHdr := header.ICMPv6(ipHdr.Payload())
  			if d.needFilter() {
@@ -72,6 +72,7 @@ index cb3cd20..1791ee4 100644
  			}
 -			d.logger.TraceContext(d.ctx, "read ICMPv6 echo reply from ", ipHdr.SourceAddr(), " to ", ipHdr.DestinationAddr(), " id ", icmpHdr.Ident(), " seq ", icmpHdr.Sequence())
  		}
+ 		d.lastActive.Store(time.Now())
  		err = d.routeContext.WritePacket(buffer.Bytes())
  		if err != nil {
 @@ -244,6 +252,52 @@ func (d *Destination) rewriteICMPv4Error(ipHdr header.IPv4, icmpHdr header.ICMPv
