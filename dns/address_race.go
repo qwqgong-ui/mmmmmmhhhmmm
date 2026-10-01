@@ -86,6 +86,11 @@ func (c *addressRaceClient) Address() string { return c.address }
 
 func (c *addressRaceClient) acquire(ip netip.Addr) (dnsClient, func()) {
 	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.acquireLocked(ip)
+}
+
+func (c *addressRaceClient) acquireLocked(ip netip.Addr) (dnsClient, func()) {
 	e := c.clients[ip]
 	if e == nil {
 		e = &addressClientEntry{client: c.new(ip)}
@@ -93,7 +98,6 @@ func (c *addressRaceClient) acquire(ip netip.Addr) (dnsClient, func()) {
 	}
 	e.users++
 	e.stale = false
-	c.mu.Unlock()
 	return e.client, func() {
 		c.mu.Lock()
 		e.users--
@@ -173,11 +177,12 @@ func validAddressResponse(msg *D.Msg, err error) error {
 func (c *addressRaceClient) exchangeWinner(ctx context.Context, query *D.Msg) (*D.Msg, error, bool) {
 	c.mu.Lock()
 	ip, version := c.winner, c.winnerVersion
-	c.mu.Unlock()
 	if !ip.IsValid() {
+		c.mu.Unlock()
 		return nil, nil, false
 	}
-	client, release := c.acquire(ip)
+	client, release := c.acquireLocked(ip)
+	c.mu.Unlock()
 	defer release()
 	msg, err := client.ExchangeContext(ctx, query.Copy())
 	err = validAddressResponse(msg, err)
@@ -221,7 +226,10 @@ func (c *addressRaceClient) race(ctx context.Context, query *D.Msg) (*D.Msg, err
 	}
 	pendingLookups, pendingQueries := 2, 0
 	seen := make(map[netip.Addr]bool)
-	defer c.prune(seen)
+	// Retire every losing transport, including established QUIC sessions.
+	// In-flight losers are canceled below and closed when their users release.
+	keep := make(map[netip.Addr]bool)
+	defer c.prune(keep)
 	var errs []error
 	for pendingLookups+pendingQueries > 0 {
 		select {
@@ -252,6 +260,7 @@ func (c *addressRaceClient) race(ctx context.Context, query *D.Msg) (*D.Msg, err
 			}
 			pendingQueries--
 			if e.err == nil {
+				keep[e.ip] = true
 				c.mu.Lock()
 				c.winner = e.ip
 				c.winnerVersion++

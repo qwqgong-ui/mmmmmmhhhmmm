@@ -183,10 +183,15 @@ type addressRaceStub struct {
 	gate     <-chan struct{}
 	started  chan<- netip.Addr
 	canceled chan<- netip.Addr
+	closed   chan<- netip.Addr
 }
 
-func (s *addressRaceStub) Address() string  { return s.ip.String() }
-func (s *addressRaceStub) ResetConnection() {}
+func (s *addressRaceStub) Address() string { return s.ip.String() }
+func (s *addressRaceStub) ResetConnection() {
+	if s.closed != nil {
+		s.closed <- s.ip
+	}
+}
 func (s *addressRaceStub) ExchangeContext(ctx context.Context, q *D.Msg) (*D.Msg, error) {
 	s.started <- s.ip
 	select {
@@ -209,13 +214,14 @@ func TestAddressRaceAllFamiliesAndCancellation(t *testing.T) {
 		t.Run(winner.String(), func(t *testing.T) {
 			gate := make(chan struct{})
 			started, canceled := make(chan netip.Addr, 4), make(chan netip.Addr, 4)
+			closed := make(chan netip.Addr, 4)
 			c := &addressRaceClient{host: "dns-race.test", r: addressRaceResolver{v4: ips[:2], v6: ips[2:]}, clients: make(map[netip.Addr]*addressClientEntry)}
 			c.new = func(ip netip.Addr) dnsClient {
 				var ready <-chan struct{}
 				if ip == winner {
 					ready = gate
 				}
-				return &addressRaceStub{ip: ip, gate: ready, started: started, canceled: canceled}
+				return &addressRaceStub{ip: ip, gate: ready, started: started, canceled: canceled, closed: closed}
 			}
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 			defer cancel()
@@ -248,6 +254,22 @@ func TestAddressRaceAllFamiliesAndCancellation(t *testing.T) {
 				case <-ctx.Done():
 					t.Fatal("losing queries not canceled")
 				}
+			}
+			for range len(ips) - 1 {
+				select {
+				case ip := <-closed:
+					if ip == winner {
+						t.Fatal("winning transport was closed")
+					}
+				case <-ctx.Done():
+					t.Fatal("losing transports were not closed")
+				}
+			}
+			c.mu.Lock()
+			onlyWinner := len(c.clients) == 1 && c.clients[winner] != nil
+			c.mu.Unlock()
+			if !onlyWinner {
+				t.Fatal("losing transports remained cached")
 			}
 		})
 	}
