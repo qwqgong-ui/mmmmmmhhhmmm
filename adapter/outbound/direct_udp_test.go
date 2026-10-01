@@ -17,12 +17,13 @@ type directUDPTestPacket struct {
 }
 
 type directUDPTestConn struct {
-	mu     sync.Mutex
-	writes []netip.AddrPort
-	reads  chan directUDPTestPacket
-	errs   chan error
-	closed chan struct{}
-	once   sync.Once
+	mu       sync.Mutex
+	writes   []netip.AddrPort
+	payloads [][]byte
+	reads    chan directUDPTestPacket
+	errs     chan error
+	closed   chan struct{}
+	once     sync.Once
 }
 
 func newDirectUDPTestConn() *directUDPTestConn {
@@ -47,6 +48,7 @@ func (c *directUDPTestConn) ReadFrom(payload []byte) (int, net.Addr, error) {
 func (c *directUDPTestConn) WriteTo(payload []byte, addr net.Addr) (int, error) {
 	c.mu.Lock()
 	c.writes = append(c.writes, addr.(*net.UDPAddr).AddrPort())
+	c.payloads = append(c.payloads, append([]byte(nil), payload...))
 	c.mu.Unlock()
 	return len(payload), nil
 }

@@ -67,9 +67,14 @@ type directUDPTarget struct {
 	// better thing to settle on than a candidate that merely accepted a send.
 	responder                netip.AddrPort
 	quicCandidateByServerCID map[string]netip.AddrPort
+	collectingCandidates     bool
+	replay                   [][]byte
+	replayBytes              int
 }
 
 type directUDPRacePacketConn struct {
+	ctx       context.Context
+	cancel    context.CancelFunc
 	mu        sync.Mutex
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -84,11 +89,6 @@ type directUDPRacePacketConn struct {
 }
 
 func (d *Direct) listenPacketRaceContext(ctx context.Context, metadata *C.Metadata) (C.PacketConn, error) {
-	candidates, fallback, err := d.resolveUDPRaceCandidates(ctx, metadata)
-	if err != nil {
-		return nil, err
-	}
-	metadata.DstIP = fallback
 	opts := d.DialOptions()
 	if metadata.DontFragment {
 		opts = append(opts, dialer.WithDontFragment(true))
@@ -100,67 +100,24 @@ func (d *Direct) listenPacketRaceContext(ctx context.Context, metadata *C.Metada
 		}
 		return newPathMTUPacketConn(packetConn, opts), nil
 	})
-	logical := metadata.AddrPort()
-	if err := race.register(ctx, logical, candidates, metadata.Host, d.Name()); err != nil {
+	if err := d.registerProgressiveUDPTarget(ctx, race, metadata); err != nil {
+		_ = race.Close()
 		return nil, err
 	}
 	resolveUDP := func(ctx context.Context, metadata *C.Metadata) error {
-		candidates, fallback, err := d.resolveUDPRaceCandidates(ctx, metadata)
-		if err != nil {
-			return err
-		}
-		metadata.DstIP = fallback
-		return race.register(ctx, metadata.AddrPort(), candidates, metadata.Host, d.Name())
+		return d.registerProgressiveUDPTarget(ctx, race, metadata)
 	}
 	return d.loopBack.NewPacketConn(newPacketConn(race, d, resolveUDP)), nil
 }
 
-func (d *Direct) resolveUDPRaceCandidates(ctx context.Context, metadata *C.Metadata) ([]netip.AddrPort, netip.Addr, error) {
-	type result struct {
-		ips []netip.Addr
-		err error
-	}
-	results := make(chan result, 2)
-	go func() {
-		ips, err := resolver.LookupIPv4WithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
-		results <- result{ips: ips, err: err}
-	}()
-	go func() {
-		ips, err := resolver.LookupIPv6WithResolver(ctx, metadata.Host, resolver.DirectHostResolver)
-		results <- result{ips: ips, err: err}
-	}()
-
-	var ips []netip.Addr
-	var lookupErrs []error
-	for range 2 {
-		select {
-		case <-ctx.Done():
-			return nil, netip.Addr{}, ctx.Err()
-		case result := <-results:
-			if result.err != nil {
-				lookupErrs = append(lookupErrs, result.err)
-			}
-			for _, ip := range result.ips {
-				ip = ip.Unmap()
-				if ip.IsValid() {
-					ips = append(ips, ip)
-				}
-			}
-		}
-	}
-
+func (d *Direct) orderUDPRaceCandidates(metadata *C.Metadata, ips []netip.Addr, preserveResolved bool) ([]netip.AddrPort, netip.Addr) {
 	// Preserve an already-resolved destination when the old ResolveUDP path
 	// would have done so, while still discovering the other race candidates.
 	fallback := netip.Addr{}
-	if metadata.Resolved() && resolver.DirectHostResolver == resolver.DefaultResolver {
+	if metadata.Resolved() && preserveResolved {
 		fallback = metadata.DstIP.Unmap()
 		ips = append(ips, fallback)
 	}
-	if len(ips) == 0 {
-		lookupErrs = append(lookupErrs, fmt.Errorf("%w: %s", resolver.ErrIPNotFound, metadata.Host))
-		return nil, netip.Addr{}, fmt.Errorf("can't resolve ip: %w", errors.Join(lookupErrs...))
-	}
-
 	ipv4s, ipv6s := resolver.SortationAddr(uniqueDirectUDPIPs(ips))
 	if !fallback.IsValid() {
 		switch {
@@ -193,7 +150,16 @@ func (d *Direct) resolveUDPRaceCandidates(ctx context.Context, metadata *C.Metad
 	for _, ip := range ordered {
 		candidates = append(candidates, netip.AddrPortFrom(ip, metadata.DstPort))
 	}
-	return candidates, fallback, nil
+	return candidates, fallback
+}
+
+func (target *directUDPTarget) acceptsCandidates(host, adapter string) bool {
+	window := directUDPRaceWindow
+	if target.quic {
+		window = directUDPQUICRaceWindow
+	}
+	return target.host == host && target.adapter == adapter && !target.winner.IsValid() &&
+		(target.started.IsZero() || time.Since(target.started) < window)
 }
 
 func uniqueDirectUDPIPs(ips []netip.Addr) []netip.Addr {
@@ -214,7 +180,10 @@ func uniqueDirectUDPIPs(ips []netip.Addr) []netip.Addr {
 }
 
 func newDirectUDPRacePacketConn(factory func(context.Context, int, netip.AddrPort) (net.PacketConn, error)) *directUDPRacePacketConn {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &directUDPRacePacketConn{
+		ctx:     ctx,
+		cancel:  cancel,
 		closed:  make(chan struct{}),
 		reads:   make(chan directUDPReadResult, 32),
 		conns:   make(map[int]net.PacketConn, 2),
@@ -225,6 +194,14 @@ func newDirectUDPRacePacketConn(factory func(context.Context, int, netip.AddrPor
 }
 
 func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.AddrPort, candidates []netip.AddrPort, host, adapter string) error {
+	c.mu.Lock()
+	if target := c.targets[logical]; target != nil {
+		if !target.acceptsCandidates(host, adapter) {
+			c.mu.Unlock()
+			return nil
+		}
+	}
+	c.mu.Unlock()
 	for _, candidate := range candidates {
 		family := 6
 		if candidate.Addr().Is4() {
@@ -236,14 +213,25 @@ func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.Ad
 	}
 
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return net.ErrClosed
+	default:
+	}
 	if len(c.conns) == 0 {
+		c.mu.Unlock()
 		return errors.New("can't create DIRECT UDP socket")
 	}
-	if _, loaded := c.targets[logical]; loaded {
+	target := c.targets[logical]
+	if target != nil && !target.acceptsCandidates(host, adapter) {
+		c.mu.Unlock()
 		return nil
 	}
-	target := &directUDPTarget{logical: logical, live: make(map[netip.AddrPort]bool), host: host, adapter: adapter}
+	if target == nil {
+		target = &directUDPTarget{logical: logical, live: make(map[netip.AddrPort]bool), host: host, adapter: adapter}
+	}
+	var added []netip.AddrPort
 	for _, candidate := range candidates {
 		family := 6
 		if candidate.Addr().Is4() {
@@ -252,22 +240,54 @@ func (c *directUDPRacePacketConn) register(ctx context.Context, logical netip.Ad
 		if c.conns[family] == nil {
 			continue
 		}
+		if _, exists := target.live[candidate]; exists {
+			continue
+		}
 		target.candidates = append(target.candidates, candidate)
 		target.live[candidate] = true
 		c.sources[candidate] = append(c.sources[candidate], target)
+		added = append(added, candidate)
 	}
 	if len(target.candidates) == 0 {
+		c.mu.Unlock()
 		return errors.New("no usable DIRECT UDP candidate")
 	}
 	c.targets[logical] = target
+	// Replay only the bounded opening datagrams to newly resolved paths. Without
+	// this a late family cannot answer until the application's retransmit timer.
+	var replay [][]byte
+	for _, payload := range target.replay {
+		if target.bytes+len(payload)*len(added) > directUDPRaceBytes {
+			break
+		}
+		target.bytes += len(payload) * len(added)
+		replay = append(replay, payload)
+	}
 	if log.Enabled(log.DEBUG) {
 		log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "udp_race_started", "host": host, "proxy": adapter, "candidate_count": fmt.Sprint(len(target.candidates))}, "DIRECT UDP candidates %s: %v", host, target.candidates)
+	}
+	c.mu.Unlock()
+	for _, payload := range replay {
+		_, _, failed := c.writeCandidateSet(payload, added)
+		if len(failed) > 0 {
+			c.mu.Lock()
+			for _, candidate := range failed {
+				delete(target.live, candidate)
+			}
+			c.mu.Unlock()
+		}
 	}
 	return nil
 }
 
 func (c *directUDPRacePacketConn) ensureConn(ctx context.Context, family int, remote netip.AddrPort) error {
 	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		return net.ErrClosed
+	default:
+	}
 	if c.conns[family] != nil {
 		c.mu.Unlock()
 		return nil
@@ -279,6 +299,13 @@ func (c *directUDPRacePacketConn) ensureConn(ctx context.Context, family int, re
 		return err
 	}
 	c.mu.Lock()
+	select {
+	case <-c.closed:
+		c.mu.Unlock()
+		_ = pc.Close()
+		return net.ErrClosed
+	default:
+	}
 	if existing := c.conns[family]; existing != nil {
 		c.mu.Unlock()
 		_ = pc.Close()
@@ -409,6 +436,8 @@ func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, e
 		}
 	}
 	if target.winner.IsValid() {
+		target.replay = nil
+		target.replayBytes = 0
 		candidates := []netip.AddrPort{target.winner}
 		host, adapter := target.host, target.adapter
 		c.mu.Unlock()
@@ -431,6 +460,10 @@ func (c *directUDPRacePacketConn) WriteTo(payload []byte, addr net.Addr) (int, e
 		}
 	}
 	target.bytes += len(payload) * len(candidates)
+	if target.collectingCandidates && len(target.replay) < directUDPRaceDatagrams && target.replayBytes+len(payload) <= directUDPRaceBytes {
+		target.replay = append(target.replay, append([]byte(nil), payload...))
+		target.replayBytes += len(payload)
+	}
 	c.mu.Unlock()
 
 	n, err, failed := c.writeCandidateSet(payload, candidates)
@@ -637,6 +670,7 @@ func (c *directUDPRacePacketConn) ReadFrom(payload []byte) (int, net.Addr, error
 func (c *directUDPRacePacketConn) Close() error {
 	var errs []error
 	c.closeOnce.Do(func() {
+		c.cancel()
 		close(c.closed)
 		c.mu.Lock()
 		for _, pc := range c.conns {
