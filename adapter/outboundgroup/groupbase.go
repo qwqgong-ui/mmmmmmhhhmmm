@@ -274,34 +274,43 @@ func (gb *GroupBase) onDialFailed(adapterType C.AdapterType, err error, fn func(
 			return
 		}
 
-		gb.failedTestMux.Lock()
-		defer gb.failedTestMux.Unlock()
-
-		gb.failedTimes++
-		if gb.failedTimes == 1 {
-			log.Debugln("ProxyGroup: %s first failed", gb.Name())
-			gb.failedTime = time.Now()
-		} else {
-			if time.Since(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
-				gb.failedTimes = 0
-				return
-			}
-
-			log.Debugln("ProxyGroup: %s failed count: %d", gb.Name(), gb.failedTimes)
-			if gb.failedTimes >= gb.maxFailedTimes {
-				log.Warnln("because %s failed multiple times, activate health check", gb.Name())
-				fn()
-			}
+		if gb.recordDialFailure(time.Now()) {
+			// Callbacks can reset the counter, so run them outside its lock.
+			fn()
 		}
 	}()
 }
 
-func (gb *GroupBase) healthCheck() {
+func (gb *GroupBase) recordDialFailure(now time.Time) bool {
+	gb.failedTestMux.Lock()
+	defer gb.failedTestMux.Unlock()
 	if gb.failedTesting.Load() {
+		return false
+	}
+	if gb.failedTimes == 0 || now.Sub(gb.failedTime) > time.Duration(gb.testTimeout)*time.Millisecond {
+		gb.failedTimes = 0
+		gb.failedTime = now
+	}
+	gb.failedTimes++
+	return gb.failedTimes >= gb.maxFailedTimes
+}
+
+func (gb *GroupBase) healthCheck() {
+	gb.failedTestMux.Lock()
+	if gb.failedTesting.Load() {
+		gb.failedTestMux.Unlock()
 		return
 	}
-
 	gb.failedTesting.Store(true)
+	gb.failedTestMux.Unlock()
+	defer func() {
+		gb.failedTestMux.Lock()
+		gb.failedTimes = 0
+		gb.failedTime = time.Time{}
+		gb.failedTesting.Store(false)
+		gb.failedTestMux.Unlock()
+	}()
+	log.Warnln("because %s dial failed, activate health check", gb.Name())
 	wg := sync.WaitGroup{}
 	for _, proxyProvider := range gb.providers {
 		wg.Add(1)
@@ -313,12 +322,13 @@ func (gb *GroupBase) healthCheck() {
 	}
 
 	wg.Wait()
-	gb.failedTesting.Store(false)
-	gb.failedTimes = 0
 }
 
 func (gb *GroupBase) onDialSuccess() {
+	gb.failedTestMux.Lock()
+	defer gb.failedTestMux.Unlock()
 	if !gb.failedTesting.Load() {
 		gb.failedTimes = 0
+		gb.failedTime = time.Time{}
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/singledo"
 	"github.com/metacubex/mihomo/common/utils"
@@ -14,54 +15,10 @@ import (
 	"github.com/metacubex/mihomo/log"
 
 	"github.com/dlclark/regexp2"
-	"github.com/metacubex/randv2"
 	"golang.org/x/sync/errgroup"
 )
 
-const (
-	healthCheckConcurrency   = 10
-	healthCheckProbeStartMin = 15 * time.Millisecond
-	healthCheckProbeStartMax = 50 * time.Millisecond
-)
-
-type probeStartPacer struct {
-	mu        sync.Mutex
-	lastStart time.Time
-}
-
-// healthCheckProbePacer is shared by every provider so simultaneous startup,
-// update, manual, and failure-triggered checks cannot burst probes together.
-var healthCheckProbePacer probeStartPacer
-
-func randomHealthCheckProbeStartInterval() time.Duration {
-	const step = time.Millisecond
-	steps := int((healthCheckProbeStartMax-healthCheckProbeStartMin)/step) + 1
-	return healthCheckProbeStartMin + time.Duration(randv2.IntN(steps))*step
-}
-
-func (p *probeStartPacer) wait(ctx context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-
-	if !p.lastStart.IsZero() {
-		wait := randomHealthCheckProbeStartInterval() - time.Since(p.lastStart)
-		if wait > 0 {
-			timer := time.NewTimer(wait)
-			defer timer.Stop()
-			select {
-			case <-timer.C:
-			case <-ctx.Done():
-				return ctx.Err()
-			}
-		}
-	}
-
-	p.lastStart = time.Now()
-	return nil
-}
+const healthCheckConcurrency = 10
 
 type HealthCheckOption struct {
 	URL      string
@@ -225,10 +182,11 @@ func (hc *HealthCheck) execute(b *errgroup.Group, url, uid string, option *extra
 
 		p := proxy
 		b.Go(func() error {
-			if err := healthCheckProbePacer.wait(hc.ctx); err != nil {
+			probeCtx, err := adapter.PrepareURLTest(hc.ctx)
+			if err != nil {
 				return nil
 			}
-			ctx, cancel := context.WithTimeout(hc.ctx, hc.timeout)
+			ctx, cancel := context.WithTimeout(probeCtx, hc.timeout)
 			defer cancel()
 			log.Debugln("Health Checking, proxy: %s, url: %s, id: {%s}", p.Name(), url, uid)
 			wasAlive := p.AliveForTestUrl(url)
