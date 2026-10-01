@@ -139,7 +139,7 @@ func (doh *dnsOverHTTPS) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.
 	// is necessary to make HTTP client usable.  We need to make 2 attempts in
 	// the case when the connection was closed (due to inactivity for example)
 	// AND the server refuses to open a 0-RTT connection.
-	for i := 0; isCached && doh.shouldRetry(err) && i < 2; i++ {
+	for i := 0; isCached && doh.shouldRetry(err) && ctx.Err() == nil && i < 2; i++ {
 		client, err = doh.resetClient(ctx, err)
 		if err != nil {
 			return nil, fmt.Errorf("failed to reset http client: %w", err)
@@ -148,7 +148,7 @@ func (doh *dnsOverHTTPS) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.
 		msg, err = doh.exchangeHTTPS(ctx, client, m)
 	}
 
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+	if err != nil && ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
 		// If the request failed anyway, make sure we don't use this client.
 		_, resErr := doh.resetClient(ctx, err)
 

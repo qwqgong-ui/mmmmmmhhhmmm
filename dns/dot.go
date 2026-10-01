@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/common/deque"
 	"github.com/metacubex/mihomo/component/ca"
 	C "github.com/metacubex/mihomo/constant"
@@ -85,7 +86,15 @@ func (t *dnsOverTLS) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, err
 				UDPSize: dClient.UDPSize,
 			}
 
+			activeConn := conn
+			stop := contextutils.AfterFunc(ctx, func() { _ = activeConn.Close() })
 			msg, _, err = dClient.ExchangeWithConn(m, dConn)
+			stop()
+			if ctx.Err() != nil {
+				_ = conn.Close()
+				err = ctx.Err()
+				return
+			}
 			if err != nil {
 				_ = conn.Close()
 				conn = nil

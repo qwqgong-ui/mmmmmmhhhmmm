@@ -44,6 +44,7 @@ type option struct {
 	routingMark   int
 	network       int
 	prefer        int
+	concurrentTCP bool
 	directRace    bool
 	directAdapter string
 	tfo           bool
@@ -103,6 +104,14 @@ func WithPreferIPv4() Option {
 func WithPreferIPv6() Option {
 	return func(opt *option) {
 		opt.prefer = 6
+	}
+}
+
+// WithConcurrentTCP races every resolved address on each TCP dial, without
+// address-family preference or the global TCP winner cache's head start.
+func WithConcurrentTCP() Option {
+	return func(opt *option) {
+		opt.concurrentTCP = true
 	}
 }
 

@@ -136,6 +136,7 @@ func transform(servers []NameServer, resolver resolver.Resolver) []dnsClient {
 		default:
 			c = newClient(s.Addr, resolver, s.Net, s.Params, s.ProxyAdapter, s.ProxyName)
 		}
+		c = raceNameServerAddresses(c, s, resolver)
 		c = rewrapClient(c, s.Params)
 		ret = append(ret, c)
 	}

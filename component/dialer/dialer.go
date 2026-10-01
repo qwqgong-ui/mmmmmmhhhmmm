@@ -75,6 +75,12 @@ func DialContext(ctx context.Context, network, address string, options ...Option
 	if err != nil {
 		return nil, err
 	}
+	if opt.concurrentTCP && isTCPNetwork(network) {
+		raceCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+		result := parallelDialContext(raceCtx, network, ips, port, opt)
+		return result.Conn, result.error
+	}
 	host, _, _ := net.SplitHostPort(address)
 
 	tcpConcurrent := GetTcpConcurrent()

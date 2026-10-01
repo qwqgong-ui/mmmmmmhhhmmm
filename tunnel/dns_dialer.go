@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"net/netip"
 	"strings"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -23,6 +24,15 @@ type DNSDialer struct {
 	proxyName     string
 	interfaceName string
 	systemDNS     bool
+	destination   netip.Addr
+}
+
+// WithDestination pins the transport address while retaining the original
+// hostname for TLS verification and domain-based routing.
+func (d *DNSDialer) WithDestination(ip netip.Addr) *DNSDialer {
+	copy := *d
+	copy.destination = ip.Unmap()
+	return &copy
 }
 
 func NewDNSDialer(r resolver.Resolver, proxyAdapter C.ProxyAdapter, proxyName string) *DNSDialer {
@@ -41,7 +51,8 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 	r := d.r
 	proxyName := d.proxyName
 	proxyAdapter := d.proxyAdapter
-	opts := []dialer.Option{dialer.WithPreferIPv6()}
+	// Race all IPv4/IPv6 TCP addresses, regardless of global tcp-concurrent.
+	opts := []dialer.Option{dialer.WithConcurrentTCP()}
 	if d.interfaceName != "" {
 		opts = append(opts, dialer.WithInterface(d.interfaceName))
 	}
@@ -56,6 +67,12 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 	err := metadata.SetRemoteAddress(addr) // tcp can resolve host by remote
 	if err != nil {
 		return nil, err
+	}
+	if d.destination.IsValid() {
+		metadata.DstIP = d.destination
+		_, port, _ := net.SplitHostPort(addr)
+		addr = net.JoinHostPort(d.destination.String(), port)
+		opts = append(opts, dialer.WithOnlySingleStack(d.destination.Is4()))
 	}
 	if !strings.Contains(network, "tcp") {
 		metadata.NetWork = C.UDP
@@ -163,6 +180,9 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 	err := metadata.SetRemoteAddress(addr)
 	if err != nil {
 		return nil, err
+	}
+	if d.destination.IsValid() {
+		metadata.DstIP = d.destination
 	}
 	if !metadata.Resolved() {
 		// udp must resolve host first

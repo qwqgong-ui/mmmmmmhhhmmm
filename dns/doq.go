@@ -127,7 +127,7 @@ func (doq *dnsOverQUIC) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.M
 		msg, err = doq.exchangeQUIC(ctx, m)
 	}
 
-	if err != nil {
+	if err != nil && ctx.Err() == nil {
 		// If we're unable to exchange messages, make sure the connection is
 		// closed and signal about an internal error.
 		doq.closeConnWithError(err)
