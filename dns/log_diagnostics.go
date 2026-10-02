@@ -12,6 +12,13 @@ import (
 	D "github.com/miekg/dns"
 )
 
+func normalizeDNSExchangeError(ctx context.Context, err error) error {
+	if err != nil && ctx.Err() != nil {
+		return ctx.Err()
+	}
+	return err
+}
+
 func logDNSCache(q D.Question, state, scope string) {
 	switch state {
 	case "fresh":
@@ -34,6 +41,9 @@ func exchangeDiagnostic(ctx context.Context, client dnsClient, query *D.Msg, sou
 		start = time.Now()
 	}
 	msg, err = client.ExchangeContext(ctx, query)
+	// Socket deadlines and QUIC stream resets are transport representations of
+	// cancellation. Classify the query by its context, not that representation.
+	err = normalizeDNSExchangeError(ctx, err)
 	if err == nil && hasUpstreamFakeIP(msg) {
 		msg, err = nil, errUpstreamFakeIP
 	}

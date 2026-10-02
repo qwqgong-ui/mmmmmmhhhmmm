@@ -52,7 +52,7 @@ func dnsReadConfig() ([]systemNameServer, error) {
 	servers := make([]systemNameServer, 0, len(addresses))
 	for _, address := range addresses {
 		if usableSystemDNS(address) {
-			servers = append(servers, systemNameServer{address: address.String(), interfaceName: interfaceName})
+			servers = append(servers, scopedSystemNameServer(address, interfaceName))
 		}
 	}
 	return servers, nil
@@ -85,7 +85,7 @@ func readLinkDNS(path, interfaceName string) ([]systemNameServer, error) {
 			if err != nil || !usableSystemDNS(address) {
 				continue
 			}
-			server := systemNameServer{address: address.String(), interfaceName: interfaceName}
+			server := scopedSystemNameServer(address, interfaceName)
 			if !containsSystemNameServer(servers, server) {
 				servers = append(servers, server)
 			}
@@ -95,6 +95,15 @@ func readLinkDNS(path, interfaceName string) ([]systemNameServer, error) {
 		return nil, err
 	}
 	return servers, nil
+}
+
+func scopedSystemNameServer(address netip.Addr, interfaceName string) systemNameServer {
+	// A link-local destination needs an interface even when the dialer's bind
+	// control deliberately skips non-global addresses. Preserve explicit zones.
+	if address.Is6() && address.IsLinkLocalUnicast() && address.Zone() == "" {
+		address = address.WithZone(interfaceName)
+	}
+	return systemNameServer{address: address.String(), interfaceName: interfaceName}
 }
 
 func containsSystemNameServer(servers []systemNameServer, target systemNameServer) bool {

@@ -108,6 +108,7 @@ func (doh *dnsOverHTTPS) Address() string {
 }
 
 func (doh *dnsOverHTTPS) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	defer func() { err = normalizeDNSExchangeError(ctx, err) }()
 	// Quote from https://www.rfc-editor.org/rfc/rfc8484.html:
 	// In order to maximize HTTP cache friendliness, DoH clients using media
 	// formats that include the ID field from the DNS message header, such

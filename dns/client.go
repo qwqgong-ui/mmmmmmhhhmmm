@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/metacubex/mihomo/common/contextutils"
 	"github.com/metacubex/mihomo/component/diagstats"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
@@ -64,10 +65,11 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 		}
 
 		msg, _, err := dClient.ExchangeWithConn(m, dConn)
+		err = normalizeDNSExchangeError(ctx, err)
 		logDNSSocket("response", conn, m, msg, err)
 
 		// Resolvers MUST resend queries over TCP if they receive a truncated UDP response (with TC=1 set)!
-		if msg != nil && msg.Truncated && network == "udp" {
+		if err == nil && ctx.Err() == nil && msg != nil && msg.Truncated && network == "udp" {
 			diagstats.Add(diagstats.DNSTCPRetry)
 			network = "tcp"
 			if log.Enabled(log.DEBUG) {
@@ -80,6 +82,8 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 				return
 			}
 			defer tcpConn.Close()
+			stop := contextutils.AfterFunc(ctx, func() { _ = tcpConn.Close() })
+			defer stop()
 			dConn.Conn = tcpConn
 			msg, _, err = dClient.ExchangeWithConn(m, dConn)
 		}
@@ -91,7 +95,7 @@ func (c *client) ExchangeContext(ctx context.Context, m *D.Msg) (*D.Msg, error) 
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	case ret := <-ch:
-		return ret.msg, ret.err
+		return ret.msg, normalizeDNSExchangeError(ctx, ret.err)
 	}
 }
 

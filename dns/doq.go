@@ -32,7 +32,8 @@ const (
 	// QUICCodeInternalError signals that the DoQ implementation encountered
 	// an internal error and is incapable of pursuing the transaction or the
 	// connection.
-	QUICCodeInternalError = quic.ApplicationErrorCode(1)
+	QUICCodeInternalError    = quic.ApplicationErrorCode(1)
+	QUICCodeRequestCancelled = quic.StreamErrorCode(3)
 	// QUICKeepAlivePeriod is the value that we pass to *quic.Config and that
 	// controls the period with with keep-alive frames are being sent to the
 	// connection. We set it to 20s as it would be in the quic-go@v0.27.1 with
@@ -92,6 +93,7 @@ func newDoQ(addr string, resolver resolver.Resolver, params map[string]string, p
 func (doq *dnsOverQUIC) Address() string { return doq.addr }
 
 func (doq *dnsOverQUIC) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.Msg, err error) {
+	defer func() { err = normalizeDNSExchangeError(ctx, err) }()
 	// When sending queries over a QUIC connection, the DNS Message ID MUST be
 	// set to zero.
 	m = m.Copy()
@@ -106,31 +108,33 @@ func (doq *dnsOverQUIC) ExchangeContext(ctx context.Context, m *D.Msg) (msg *D.M
 	}()
 
 	// Check if there was already an active conn before sending the request.
-	// We'll only attempt to re-connect if there was one.
+	// Also allow retry when a newly established connection closes before its
+	// first stream opens; failed initial handshakes are not retried here.
 	hasConnection := doq.hasConnection()
 
 	// Make the first attempt to send the DNS query.
-	msg, err = doq.exchangeQUIC(ctx, m)
+	var used *quic.Conn
+	msg, err = doq.exchangeQUIC(ctx, m, &used)
 
 	// Make up to 2 attempts to re-open the QUIC connection and send the request
 	// again.  There are several cases where this workaround is necessary to
 	// make DoQ usable.  We need to make 2 attempts in the case when the
 	// connection was closed (due to inactivity for example) AND the server
 	// refuses to open a 0-RTT connection.
-	for i := 0; hasConnection && doq.shouldRetry(err) && ctx.Err() == nil && i < 2; i++ {
+	for i := 0; (hasConnection || used != nil) && doq.shouldRetry(err) && ctx.Err() == nil && i < 2; i++ {
 		log.Debugln("re-creating the QUIC connection and retrying due to %v", err)
 
 		// Close the active connection to make sure we'll try to re-connect.
-		doq.closeConnWithError(err)
+		doq.closeConnIfCurrent(used, err)
 
 		// Retry sending the request.
-		msg, err = doq.exchangeQUIC(ctx, m)
+		msg, err = doq.exchangeQUIC(ctx, m, &used)
 	}
 
 	if err != nil && ctx.Err() == nil {
 		// If we're unable to exchange messages, make sure the connection is
 		// closed and signal about an internal error.
-		doq.closeConnWithError(err)
+		doq.closeConnIfCurrent(used, err)
 	}
 
 	return msg, err
@@ -156,7 +160,8 @@ func (doq *dnsOverQUIC) ResetConnection() {
 
 // exchangeQUIC attempts to open a QUIC connection, send the DNS message
 // through it and return the response it got from the server.
-func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg) (resp *D.Msg, err error) {
+func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg, used **quic.Conn) (resp *D.Msg, err error) {
+	*used = nil
 	// All DNS messages (queries and responses) sent over DoQ connections MUST
 	// be encoded as a 2-octet length field followed by the message content as
 	// specified in [RFC1035].
@@ -177,6 +182,7 @@ func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg) (resp *D.M
 	if err != nil {
 		return nil, err
 	}
+	*used = conn
 
 	var stream *quic.Stream
 	stream, err = doq.openStream(ctx, conn)
@@ -184,10 +190,17 @@ func (doq *dnsOverQUIC) exchangeQUIC(ctx context.Context, msg *D.Msg) (resp *D.M
 		return nil, err
 	}
 
-	stop := contextutils.AfterFunc(ctx, func() {
-		_ = stream.SetDeadline(time.Now()) // cancel any read or write operation on this stream
-	})
-	defer stop()
+	cancelStream := func() {
+		stream.CancelRead(QUICCodeRequestCancelled)
+		stream.CancelWrite(QUICCodeRequestCancelled)
+	}
+	stop := contextutils.AfterFunc(ctx, cancelStream)
+	defer func() {
+		stop()
+		if err != nil {
+			cancelStream()
+		}
+	}()
 
 	_, err = stream.Write(buf[:2+len(b)])
 	if err != nil {
@@ -238,6 +251,9 @@ func (doq *dnsOverQUIC) shouldRetry(err error) (ok bool) {
 // connection.  If it is false, we will forcibly create a new connection and
 // close the existing one if needed.
 func (doq *dnsOverQUIC) getConnection(ctx context.Context, useCached bool) (*quic.Conn, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	var conn *quic.Conn
 	doq.connMu.RLock()
 	conn = doq.conn
@@ -246,15 +262,21 @@ func (doq *dnsOverQUIC) getConnection(ctx context.Context, useCached bool) (*qui
 
 		return conn, nil
 	}
-	if conn != nil {
-		// we're recreating the connection, let's create a new one.
-		_ = conn.CloseWithError(QUICCodeNoError, "")
-	}
 	doq.connMu.RUnlock()
 
 	doq.connMu.Lock()
 	defer doq.connMu.Unlock()
-
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	// Another query may have connected while this query waited for the lock.
+	if doq.conn != nil {
+		if useCached {
+			return doq.conn, nil
+		}
+		_ = doq.conn.CloseWithError(QUICCodeNoError, "")
+		doq.conn = nil
+	}
 	var err error
 	conn, err = doq.openConnection(ctx)
 	if err != nil {
@@ -294,22 +316,9 @@ func (doq *dnsOverQUIC) resetQUICConfig() {
 
 // openStream opens a new QUIC stream for the specified connection.
 func (doq *dnsOverQUIC) openStream(ctx context.Context, conn *quic.Conn) (*quic.Stream, error) {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	stream, err := conn.OpenStreamSync(ctx)
-	if err == nil {
-		return stream, nil
-	}
-
-	// We can get here if the old QUIC connection is not valid anymore.  We
-	// should try to re-create the connection again in this case.
-	newConn, err := doq.getConnection(ctx, false)
-	if err != nil {
-		return nil, err
-	}
-	// Open a new stream.
-	return newConn.OpenStreamSync(ctx)
+	// ExchangeContext retries connection failures with identity checks. A
+	// canceled opener must never replace a connection used by other queries.
+	return conn.OpenStreamSync(ctx)
 }
 
 // openConnection opens a new QUIC connection.
@@ -375,10 +384,20 @@ func (doq *dnsOverQUIC) openConnection(ctx context.Context) (quicConn *quic.Conn
 // new queries were processed in another connection.  We can do that in the case
 // of a fatal error.
 func (doq *dnsOverQUIC) closeConnWithError(err error) {
+	doq.closeConn(nil, err)
+}
+
+func (doq *dnsOverQUIC) closeConnIfCurrent(conn *quic.Conn, err error) {
+	if conn != nil {
+		doq.closeConn(conn, err)
+	}
+}
+
+func (doq *dnsOverQUIC) closeConn(expected *quic.Conn, err error) {
 	doq.connMu.Lock()
 	defer doq.connMu.Unlock()
 
-	if doq.conn == nil {
+	if doq.conn == nil || (expected != nil && doq.conn != expected) {
 		// Do nothing, there's no active conn anyways.
 		return
 	}

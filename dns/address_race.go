@@ -30,7 +30,7 @@ type addressRaceClient struct {
 	clients       map[netip.Addr]*addressClientEntry
 	winner        netip.Addr
 	winnerVersion uint64
-	selectionMu   sync.Mutex
+	selection     chan struct{}
 }
 
 func raceNameServerAddresses(base dnsClient, ns NameServer, r R.Resolver) dnsClient {
@@ -148,8 +148,18 @@ func (c *addressRaceClient) ExchangeContext(ctx context.Context, query *D.Msg) (
 		return msg, err
 	}
 	// Only one caller selects a replacement. Waiting callers reuse its winner.
-	c.selectionMu.Lock()
-	defer c.selectionMu.Unlock()
+	c.mu.Lock()
+	if c.selection == nil {
+		c.selection = make(chan struct{}, 1)
+	}
+	selection := c.selection
+	c.mu.Unlock()
+	select {
+	case selection <- struct{}{}:
+		defer func() { <-selection }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
