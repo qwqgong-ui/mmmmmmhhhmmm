@@ -402,6 +402,14 @@ func runProgressiveDirectRace(
 				continue
 			}
 			if cachePending || fastPriority {
+				if cachePending && event.ipv6 != cachedIPv6 {
+					// A historical winner in the other family has not yet been
+					// validated by DNS. Do not hold usable IPv4 behind slow AAAA.
+					for _, ip := range event.IPs {
+						start(ip, event.ipv6)
+					}
+					continue
+				}
 				for _, ip := range event.IPs {
 					queued = append(queued, queuedCandidate{ip: ip, ipv6: event.ipv6})
 				}

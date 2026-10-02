@@ -47,14 +47,21 @@ func (r *Resolver) exchangeDirectSource(ctx context.Context, source int, query *
 	if err != nil {
 		return nil, err
 	}
-	if msg == nil || msg.Truncated || msg.Rcode != D.RcodeSuccess {
+	if msg == nil || msg.Truncated || (msg.Rcode != D.RcodeSuccess && msg.Rcode != D.RcodeNameError) {
 		if msg == nil {
 			return nil, errors.New("empty DNS response")
 		}
 		return nil, fmt.Errorf("server failure: %s", D.RcodeToString[msg.Rcode])
 	}
-	if len(msgToIP(msg)) == 0 {
-		return nil, R.ErrIPNotFound
+	if len(msgToAddressIPs(msg, query.Question[0].Qtype)) == 0 && msg.Rcode == D.RcodeSuccess {
+		var soa, referral bool
+		for _, rr := range msg.Ns {
+			soa = soa || rr.Header().Rrtype == D.TypeSOA
+			referral = referral || rr.Header().Rrtype == D.TypeNS
+		}
+		if referral && !soa {
+			return nil, errors.New("unresolved DNS referral")
+		}
 	}
 	if log.Enabled(log.DEBUG) {
 		log.Debugln("[DNS] %s --> %s from direct-nameserver #%d %s", domain, msgToLogString(msg), source+1, client.Address())
@@ -62,7 +69,7 @@ func (r *Resolver) exchangeDirectSource(ctx context.Context, source int, query *
 	return msg, nil
 }
 
-func (r *Resolver) directCachedCandidates(key string, sourceCount int) []netip.Addr {
+func (r *Resolver) directCachedCandidates(key string, sourceCount int, qType uint16) []netip.Addr {
 	seen := make(map[netip.Addr]struct{})
 	var candidates []netip.Addr
 	for source := 0; source < min(sourceCount, len(r.sourceCaches)); source++ {
@@ -70,7 +77,7 @@ func (r *Resolver) directCachedCandidates(key string, sourceCount int) []netip.A
 		if !hit || msg == nil {
 			continue
 		}
-		for _, ip := range msgToIP(msg) {
+		for _, ip := range msgToAddressIPs(msg, qType) {
 			ip = ip.Unmap()
 			if _, loaded := seen[ip]; loaded {
 				continue
@@ -117,7 +124,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 				if !time.Now().Before(due) {
 					refresh()
 				}
-				output <- R.IPCandidateBatch{IPs: msgToIP(msg), Source: -1}
+				output <- R.IPCandidateBatch{IPs: msgToAddressIPs(msg, q.Qtype), Source: -1}
 				return
 			}
 			msg, err := refresh()(ctx)
@@ -125,31 +132,45 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 				output <- R.IPCandidateBatch{Err: err}
 				return
 			}
-			output <- R.IPCandidateBatch{IPs: msgToIP(msg), Source: -1}
+			output <- R.IPCandidateBatch{IPs: msgToAddressIPs(msg, q.Qtype), Source: -1}
 			return
 		}
-		candidates := r.directCachedCandidates(key, len(r.main))
+		candidates := r.directCachedCandidates(key, len(r.main), q.Qtype)
 		fresh := false
-		if msg, due, hit := readUpstreamCache(r.cache, key); hit && msg != nil {
-			if len(candidates) == 0 {
-				candidates = append(candidates, msgToIP(msg)...)
-			}
-			fresh = time.Now().Before(due)
-		}
+		cached := false
+		hasSource := false
+		allSourcesFresh := len(r.sourceCaches) == len(r.main)
 		hasStaleSource := false
 		for source, c := range r.sourceCaches {
 			if _, due, hit := readUpstreamCache(c, r.directSourceCacheKey(key, source)); hit {
+				cached, hasSource = true, true
 				if time.Now().Before(due) {
 					fresh = true
 				} else {
 					hasStaleSource = true
+					allSourcesFresh = false
 				}
+			} else {
+				allSourcesFresh = false
+			}
+		}
+		// Once sources have complete replacements (including empty answers),
+		// an older aggregate answer must not resurrect removed addresses.
+		if !hasSource {
+			if msg, due, hit := readUpstreamCache(r.cache, key); hit && msg != nil {
+				cached = true
+				candidates = append(candidates, msgToAddressIPs(msg, q.Qtype)...)
+				fresh = time.Now().Before(due) && len(candidates) > 0
 			}
 		}
 		fresh = fresh && !hasStaleSource
 		warm := len(candidates) > 0
+		if !warm {
+			// One upstream's empty answer cannot hide another source's addresses.
+			fresh = allSourcesFresh
+		}
 		state := "miss"
-		if warm {
+		if cached {
 			state = "stale"
 			if fresh {
 				state = "fresh"
@@ -160,6 +181,9 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			output <- R.IPCandidateBatch{IPs: candidates, Source: -1}
 		}
 		if fresh {
+			if !warm {
+				output <- R.IPCandidateBatch{Source: -1}
+			}
 			return
 		}
 		fetch := func(source int) (*D.Msg, error) {
@@ -172,7 +196,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 				if err != nil {
 					return nil, time.Time{}, err
 				}
-				stored, due := prepareCachedMessage(q, msg)
+				stored, due := prepareDirectCachedMessage(q, msg)
 				if due.IsZero() {
 					due = time.Now()
 				}
@@ -181,7 +205,8 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			return wait(ctx)
 		}
 		var errs []error
-		start := 0
+		answered := false
+		tried := make(map[int]bool)
 		if warm {
 			// Refresh the first two choices plus every retained source that is
 			// due. A long TTL on one upstream must not postpone another's refresh.
@@ -200,6 +225,7 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 			}
 			answers := make(chan answer, parallel)
 			for _, source := range sources {
+				tried[source] = true
 				go func(source int) { msg, err := fetch(source); answers <- answer{source, msg, err} }(source)
 			}
 			succeeded := false
@@ -209,21 +235,32 @@ func (direct *directResolver) LookupIPCandidates(ctx context.Context, host strin
 					errs = append(errs, a.err)
 					continue
 				}
-				succeeded = true
-				output <- R.IPCandidateBatch{IPs: msgToIP(a.msg), Source: a.source}
+				answered = true
+				ips := msgToAddressIPs(a.msg, q.Qtype)
+				succeeded = succeeded || len(ips) > 0
+				output <- R.IPCandidateBatch{IPs: ips, Source: a.source}
 			}
 			if succeeded {
 				return
 			}
-			start = min(2, len(r.main))
 		}
-		for source := start; source < len(r.main); source++ {
+		for source := 0; source < len(r.main); source++ {
+			if tried[source] {
+				continue
+			}
 			msg, err := fetch(source)
 			if err != nil {
 				errs = append(errs, err)
 				continue
 			}
-			output <- R.IPCandidateBatch{IPs: msgToIP(msg), Source: source}
+			ips := msgToAddressIPs(msg, q.Qtype)
+			output <- R.IPCandidateBatch{IPs: ips, Source: source}
+			answered = true
+			if len(ips) > 0 {
+				return
+			}
+		}
+		if answered {
 			return
 		}
 		output <- R.IPCandidateBatch{Err: errors.Join(errs...)}

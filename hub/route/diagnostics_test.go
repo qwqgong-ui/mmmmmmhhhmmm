@@ -133,12 +133,39 @@ func TestActivePathReportsErrorsAndDoesNotQueryDirectForProxy(t *testing.T) {
 			t.Fatal(got)
 		}
 		for _, q := range got {
+			if q.Source == "direct_nameserver" {
+				if !allow || q.State != "no_address" || q.Error != "" {
+					t.Fatalf("empty direct answer misclassified: %+v", q)
+				}
+				continue
+			}
 			if q.State != "error" || q.Error == "" {
 				t.Fatalf("silent failure %+v", q)
 			}
 			if !allow && q.Source == "direct_nameserver" {
 				t.Fatal("proxy queried DIRECT")
 			}
+		}
+	}
+}
+
+type emptyProgressiveDiagnosticResolver struct{ emptyDiagnosticResolver }
+
+func (emptyProgressiveDiagnosticResolver) LookupIPCandidates(context.Context, string, bool, string) <-chan resolver.IPCandidateBatch {
+	ch := make(chan resolver.IPCandidateBatch, 1)
+	ch <- resolver.IPCandidateBatch{}
+	close(ch)
+	return ch
+}
+func (emptyProgressiveDiagnosticResolver) PromoteIP(string, bool, string, netip.Addr) {}
+
+func TestActivePathProgressiveNODATAIsNotFailure(t *testing.T) {
+	old := resolver.DisableIPv6.Swap(false)
+	defer resolver.DisableIPv6.Store(old)
+	got := queryPath(t.Context(), "ipv4-only.test", "scope", nil, emptyProgressiveDiagnosticResolver{}, true)
+	for _, q := range got {
+		if q.Source == "direct_nameserver" && (q.State != "no_address" || q.Error != "") {
+			t.Fatalf("NODATA: %+v", q)
 		}
 	}
 }

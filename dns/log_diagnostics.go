@@ -54,8 +54,14 @@ func exchangeDiagnostic(ctx context.Context, client dnsClient, query *D.Msg, sou
 		count := 0
 		if msg != nil {
 			count = len(msgToIP(msg))
+			if query.Question[0].Qtype == D.TypeA || query.Question[0].Qtype == D.TypeAAAA {
+				count = len(msgToAddressIPs(msg, query.Question[0].Qtype))
+			}
 		}
 		reason := "response"
+		if msg != nil && (query.Question[0].Qtype == D.TypeA || query.Question[0].Qtype == D.TypeAAAA) && count == 0 && (msg.Rcode == D.RcodeSuccess || msg.Rcode == D.RcodeNameError) {
+			reason = "no_address"
+		}
 		if err != nil {
 			reason = "query_failed"
 			if errors.Is(err, context.Canceled) {

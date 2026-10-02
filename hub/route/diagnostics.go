@@ -155,7 +155,7 @@ func queryPath(ctx context.Context, host, scope string, service resolver.Service
 					err = nil
 				}
 				if len(q.Addresses) == 0 && err == nil {
-					err = resolver.ErrIPNotFound
+					q.State = "no_address"
 				}
 			} else {
 				var ips []netip.Addr
@@ -167,8 +167,9 @@ func queryPath(ctx context.Context, host, scope string, service resolver.Service
 				for _, ip := range ips {
 					q.Addresses = append(q.Addresses, ip.String())
 				}
-				if len(ips) == 0 && err == nil {
-					err = resolver.ErrIPNotFound
+				if len(ips) == 0 && (err == nil || errors.Is(err, resolver.ErrIPNotFound)) {
+					q.State = "no_address"
+					err = nil
 				}
 			}
 			if err != nil {
@@ -283,7 +284,7 @@ func debugPath(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	for _, query := range queries {
-		if query.Source == "direct_nameserver" && (query.State == "ok" || query.State == "partial") {
+		if query.Source == "direct_nameserver" && (query.State == "ok" || query.State == "partial" || query.State == "no_address") {
 			known = true
 			for _, ip := range query.Addresses {
 				add(ip)
