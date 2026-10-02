@@ -1,6 +1,6 @@
 # Mihomo dev 下游修改索引
 
-本文档记录 `dev` 分支相对上游 `Alpha` 保留的定制功能，按 2026-09-09 的源码整理。
+本文档记录 `dev` 分支相对上游 `Alpha` 保留的定制功能。初版按 2026-09-09 的源码整理，DNS 上游地址选择专题于 2026-10-01 按当前实现更新。
 配置示例见 [config.yaml](config.yaml)，专题见 [Hybrid QUIC](hybrid-quic.md) 和
 [服务端域名 DNS bundle](domain-dns-bundle.md)。历史测试数据只代表对应修改时的结果，不代表本次重新验证。
 
@@ -13,7 +13,7 @@ sing-tun v0.4.27 已包含 ICMP 活跃时间修复，对应重复补丁已移除
 
 ## 功能目录
 
-- [DNS 上游主机名优先使用 IPv6（DNS Upstream Hostname IPv6 Preference）](features/dns-upstream-hostname-ipv6-preference.md)
+- [DNS 上游地址竞争与胜出连接复用（DNS Upstream Address Selection）](features/dns-upstream-address-selection.md)
 - [Linux 基于连接端点的进程归属识别（Linux Endpoint-Aware Process Attribution）](features/linux-endpoint-aware-process-attribution.md)
 - [远端 UDP 目的地身份保留（Remote UDP Destination Identity）](features/remote-udp-destination-identity.md)
 - [可选协议构建标签（Optional Protocol Build Tags）](features/optional-protocol-build-tags.md)
