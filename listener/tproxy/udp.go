@@ -67,12 +67,16 @@ func NewUDP(addr string, tunnel C.Tunnel, additions ...inbound.Addition) (*UDPLi
 		oob := make([]byte, 1024)
 		for {
 			buf := pool.Get(pool.UDPBufferSize)
-			n, oobn, _, lAddr, err := c.ReadMsgUDPAddrPort(buf, oob)
+			n, oobn, flags, lAddr, err := c.ReadMsgUDPAddrPort(buf, oob)
 			if err != nil {
 				pool.Put(buf)
 				if rl.closed {
 					break
 				}
+				continue
+			}
+			if truncatedUDPMessage(flags) {
+				pool.Put(buf)
 				continue
 			}
 

@@ -100,13 +100,18 @@ func listenLocalConn(rAddr, lAddr netip.AddrPort, tunnel C.Tunnel, additions ...
 		log.Debugln("TProxy listenLocalConn rAddr=%s lAddr=%s", rAddr, lAddr)
 		for {
 			buf := pool.Get(pool.UDPBufferSize)
-			br, err := lc.Read(buf)
+			br, _, flags, _, err := lc.ReadMsgUDPAddrPort(buf, nil)
 			if err != nil {
+				pool.Put(buf)
 				if errors.Is(err, net.ErrClosed) {
 					log.Debugln("TProxy local conn listener exit.. rAddr=%s lAddr=%s", rAddr, lAddr)
-					pool.Put(buf)
 					return
 				}
+				continue
+			}
+			if truncatedUDPMessage(flags) {
+				pool.Put(buf)
+				continue
 			}
 			// since following localPackets are pass through this socket which listen rAddr
 			// I choose current listener as packet's packet conn

@@ -27,7 +27,15 @@ func (c *enhanceUDPConn) WaitReadFrom() (data []byte, put func(), addr net.Addr,
 		}
 		var readFrom syscall.Sockaddr
 		var readN int
-		readN, _, _, readFrom, readErr = syscall.Recvmsg(int(fd), readBuf, nil, 0)
+		var flags int
+		readN, _, flags, readFrom, readErr = syscall.Recvmsg(int(fd), readBuf, nil, 0)
+		if flags&syscall.MSG_TRUNC != 0 {
+			put()
+			put = nil
+			data = nil
+			readErr = syscall.EMSGSIZE
+			return true
+		}
 		if readN > 0 {
 			data = readBuf[:readN]
 		} else {

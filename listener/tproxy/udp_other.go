@@ -8,6 +8,8 @@ import (
 	"net/netip"
 )
 
+func truncatedUDPMessage(flags int) bool { return false }
+
 func getOrigDst(oob []byte) (netip.AddrPort, error) {
 	return netip.AddrPort{}, errors.New("UDP redir not supported on current platform")
 }

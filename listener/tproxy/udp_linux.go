@@ -18,6 +18,10 @@ const (
 	IPV6_RECVORIGDSTADDR = 0x4a
 )
 
+func truncatedUDPMessage(flags int) bool {
+	return flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0
+}
+
 // dialUDP acts like net.DialUDP for transparent proxy.
 // It binds to a non-local address(`lAddr`).
 func dialUDP(network string, lAddr, rAddr netip.AddrPort) (uc *net.UDPConn, err error) {
