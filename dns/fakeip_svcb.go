@@ -131,6 +131,24 @@ func rewriteFakeIPSVCBValues(
 	rewritten := make([]D.SVCBKeyValue, 0, len(values))
 	changed := false
 	var fakeIPv4, fakeIPv6 net.IP
+	// Determine allocation failures before rewriting mandatory keys. An
+	// unavailable persistent store must not produce an invalid address hint.
+	for _, value := range values {
+		switch value.Key() {
+		case D.SVCB_IPV4HINT:
+			if !removedKeys[D.SVCB_IPV4HINT] && fakeIPv4 == nil {
+				ip := fakePool.Lookup(effectiveTarget)
+				fakeIPv4 = net.IP(ip.AsSlice())
+				removedKeys[D.SVCB_IPV4HINT] = !ip.IsValid()
+			}
+		case D.SVCB_IPV6HINT:
+			if !removedKeys[D.SVCB_IPV6HINT] && fakeIPv6 == nil {
+				ip := fakePool6.Lookup(effectiveTarget)
+				fakeIPv6 = net.IP(ip.AsSlice())
+				removedKeys[D.SVCB_IPV6HINT] = !ip.IsValid()
+			}
+		}
+	}
 
 	for _, value := range values {
 		switch value.Key() {
@@ -138,9 +156,6 @@ func rewriteFakeIPSVCBValues(
 			if removedKeys[D.SVCB_IPV4HINT] {
 				changed = true
 				continue
-			}
-			if fakeIPv4 == nil {
-				fakeIPv4 = net.IP(fakePool.Lookup(effectiveTarget).AsSlice())
 			}
 			hint := value.(*D.SVCBIPv4Hint)
 			if len(hint.Hint) == 1 && hint.Hint[0].Equal(fakeIPv4) {
@@ -154,9 +169,6 @@ func rewriteFakeIPSVCBValues(
 			if removedKeys[D.SVCB_IPV6HINT] {
 				changed = true
 				continue
-			}
-			if fakeIPv6 == nil {
-				fakeIPv6 = net.IP(fakePool6.Lookup(effectiveTarget).AsSlice())
 			}
 			hint := value.(*D.SVCBIPv6Hint)
 			if len(hint.Hint) == 1 && hint.Hint[0].Equal(fakeIPv6) {

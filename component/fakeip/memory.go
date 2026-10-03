@@ -11,6 +11,14 @@ type memoryStore struct {
 	cacheHost *lru.LruCache[netip.Addr, string]
 }
 
+// PutMapping replaces both directions while the allocator holds the pool lock.
+func (m *memoryStore) PutMapping(host string, ip netip.Addr) error {
+	m.DelByIP(ip)
+	m.PutByIP(ip, host)
+	m.PutByHost(host, ip)
+	return nil
+}
+
 // GetByHost implements store.GetByHost
 func (m *memoryStore) GetByHost(host string) (netip.Addr, bool) {
 	if ip, exist := m.cacheIP.Get(host); exist {

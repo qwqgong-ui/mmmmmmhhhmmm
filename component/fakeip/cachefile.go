@@ -10,6 +10,10 @@ type cachefileStore struct {
 	cache *cachefile.FakeIpStore
 }
 
+func (c *cachefileStore) PutMapping(host string, ip netip.Addr) error {
+	return c.cache.PutMapping(host, ip)
+}
+
 // GetByHost implements store.GetByHost
 func (c *cachefileStore) GetByHost(host string) (netip.Addr, bool) {
 	return c.cache.GetByHost(host)

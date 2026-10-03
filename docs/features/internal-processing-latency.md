@@ -37,3 +37,13 @@
 依赖补丁链通过。受影响的 dev_cache、dialer、DNS、tunnel、sniffer、common/net、log、controller 和 outbound 测试通过 `-race -short -p 2`；sing-tun、ping、sing-mux 的对应检查通过。`-short` 排除原有运行数分钟的 Wi-Fi 分布模拟，本次直接使用定向延迟对照。amd64-v3 release 构建和原配置校验通过，本地服务经包管理器替换，配置校验和保持不变。
 
 按仓库要求从已提交的修复版本采集 300 秒真实服务 CPU profile，并更新 `default.pgo`。启动时启用 profiler，随后把运行日志恢复为 warning；profile 包含开始阶段的 DEBUG 检查及真实代理流量。CPU 样本合计 3.99 秒，占该采样时段 1.33%；负载与之前采样不同，不据此宣称 CPU 占用下降。
+
+## Fake-IP 持久化查询
+
+后续修复针对 `store-fake-ip: true`：分配器原先持锁执行两次 `DB.Batch`，每次等待默认 10 ms 合并窗口。现在一次 `DB.Update` 原子写入正反映射，循环复用时在同一事务删除旧映射。已有持久化映射的 Lookup、LookBack、Exist 使用数据库读快照，不再争用分配锁；内存模式保留原有池锁和容量规则。
+
+新映射仍在事务提交完成后返回，没有异步写入队列。提交失败会恢复分配器游标及循环标志；A/AAAA 返回 DNS 错误，不会发布仍属于旧域名的地址。HTTPS/SVCB 删除分配失败地址族的 hint 及对应 mandatory 引用，保留其他参数。清理和保存状态与分配串行，重开数据库验证旧映射清理及双栈恢复。
+
+同机临时数据库的三轮新映射计时从 20.46–20.55 ms 降为 21.7–27.5 μs；这个存储位置不能代表实际服务磁盘的提交成本。故意阻塞写事务时，已有映射的三种读操作合计 12–56 μs，且新映射仍须等写事务释放。真实 DNS 总耗时还可能包含域名 bundle 查询、磁盘提交和调度等待，不能把本地分配耗时当成完整 DNS 耗时。
+
+回归测试覆盖 IPv4/IPv6 读快路径、绕过 Batch 定时器、循环复用的完整读快照、事务失败回滚、清理后重开、正常保存后重开和分配/清理/保存的并发竞争。Fake-IP、cachefile、DNS、tunnel 的 `-race -short` 检查通过。

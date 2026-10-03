@@ -1,6 +1,7 @@
 package cachefile
 
 import (
+	"errors"
 	"net/netip"
 
 	"github.com/metacubex/mihomo/log"
@@ -19,6 +20,31 @@ func (c *CacheFile) FakeIpStore() *FakeIpStore {
 
 func (c *CacheFile) FakeIpStore6() *FakeIpStore {
 	return &FakeIpStore{c, bucketFakeip6}
+}
+
+// PutMapping commits both directions together, including replacement of a
+// recycled IP. DB.Update avoids Batch's timer on the DNS response path; readers
+// continue to use the previous committed snapshot until the pair is durable.
+func (c *FakeIpStore) PutMapping(host string, ip netip.Addr) error {
+	if c.DB == nil {
+		return errors.New("cache database unavailable")
+	}
+	return c.DB.Update(func(t *bbolt.Tx) error {
+		bucket, err := t.CreateBucketIfNotExists(c.bucketName)
+		if err != nil {
+			return err
+		}
+		addr := ip.AsSlice()
+		if oldHost := bucket.Get(addr); len(oldHost) > 0 {
+			if err = bucket.Delete(oldHost); err != nil {
+				return err
+			}
+		}
+		if err = bucket.Put(addr, []byte(host)); err != nil {
+			return err
+		}
+		return bucket.Put([]byte(host), addr)
+	})
 }
 
 func (c *FakeIpStore) GetByHost(host string) (ip netip.Addr, exist bool) {
@@ -109,6 +135,9 @@ func (c *FakeIpStore) DelByIP(ip netip.Addr) {
 }
 
 func (c *FakeIpStore) FlushFakeIP() error {
+	if c.DB == nil {
+		return errors.New("cache database unavailable")
+	}
 	err := c.DB.Batch(func(t *bbolt.Tx) error {
 		bucket := t.Bucket(c.bucketName)
 		if bucket == nil {
