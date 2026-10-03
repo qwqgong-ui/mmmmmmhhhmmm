@@ -36,6 +36,7 @@ sing-tun v0.4.27 已包含 ICMP 活跃时间修复，对应重复补丁已移除
 - [Hybrid QUIC raw 路径的连接化与零分配](features/hybrid-quic-raw-socket.md)
 - [Hybrid QUIC raw 路径的恢复与重新探测](features/hybrid-quic-raw-recovery.md)
 - [运行时诊断与结构化状态日志](features/runtime-diagnostics.md)
+- [内部处理延迟修复与计时](features/internal-processing-latency.md)
 - [dev_cache 统一缓存、刷新与网络隔离](features/dev-cache.md)
 - [AndroidCyaml 集成（AndroidCyaml Integration）](features/androidcyaml-integration.md)
 - [HY2 支持 ECN 反馈的 BBR（HY2 ECN-Aware BBR）](features/hy2-ecn-aware-bbr.md)
