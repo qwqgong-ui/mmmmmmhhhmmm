@@ -1,0 +1,55 @@
+pre_install() {
+    local previous_config=''
+    if [[ -f /etc/mihomo/config.yaml ]]; then
+        previous_config=/etc/mihomo/config.yaml
+    elif [[ -f /etc/mihomo/config.yaml.pacsave ]]; then
+        # Conflicting-package removal can precede this new package's pre_install.
+        previous_config=/etc/mihomo/config.yaml.pacsave
+    fi
+    if [[ -n "$previous_config" ]]; then
+        cp -a --backup=numbered "$previous_config" /etc/mihomo/config.before-mihomo-package.yaml || return 1
+        chmod 600 /etc/mihomo/config.before-mihomo-package.yaml
+        install -d -m700 /run/mihomo-package-migration
+        touch /run/mihomo-package-migration/preserve-config
+    fi
+    if [[ -e /etc/systemd/system/mihomo.service.d/30-transparent.conf ]]; then
+        # This known local integration is being replaced by the packaged drop-in.
+        # Preserve the user file and stop its rules before activating the new one.
+        if [[ -x /usr/local/libexec/mihomo-transparent ]]; then
+            /usr/local/libexec/mihomo-transparent stop || return 1
+        fi
+        mv --backup=numbered /etc/systemd/system/mihomo.service.d/30-transparent.conf /etc/mihomo/30-transparent.conf.manual-backup || return 1
+    fi
+}
+
+post_install() {
+    if [[ -f /run/mihomo-package-migration/preserve-config ]]; then
+        cp -a /etc/mihomo/config.before-mihomo-package.yaml /etc/mihomo/config.yaml || return 1
+        rm -f /run/mihomo-package-migration/preserve-config
+        rmdir /run/mihomo-package-migration
+    fi
+    systemctl daemon-reload
+    if /usr/lib/mihomo-tproxy/manage validate; then
+        systemctl enable mihomo.service
+        systemctl restart mihomo.service
+    else
+        echo 'TPROXY configuration is not ready; existing Mihomo configuration was not changed.' >&2
+    fi
+}
+
+pre_upgrade() {
+    pre_install || return 1
+}
+
+post_upgrade() {
+    post_install
+}
+
+pre_remove() {
+    /usr/lib/mihomo-tproxy/manage stop
+}
+
+post_remove() {
+    systemctl daemon-reload
+    systemctl try-restart mihomo.service
+}

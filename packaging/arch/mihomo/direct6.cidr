@@ -1,0 +1,4 @@
+# One explicitly direct real IPv6 address or CIDR per line.
+# Domain-based direct traffic also needs real-IP DNS answers.
+# Example (documentation network; uncomment only for testing):
+# 2001:db8::/32

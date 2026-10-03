@@ -1,0 +1,7 @@
+core_config = "/etc/mihomo/config.yaml"
+direct4 = "/etc/mihomo/direct4.cidr"
+direct6 = "/etc/mihomo/direct6.cidr"
+proxy_mark = 358 # 0x166; must differ from the core routing-mark
+route_table = 166
+bypass_priority = 50
+proxy_priority = 100

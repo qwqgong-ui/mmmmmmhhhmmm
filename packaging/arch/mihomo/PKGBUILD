@@ -1,0 +1,42 @@
+pkgname=mihomo
+pkgver=dev.r265ffd32
+pkgrel=2
+epoch=9999
+pkgdesc='Mihomo dev core with local TCP/UDP TPROXY and explicit kernel direct bypass'
+arch=('x86_64')
+url='https://github.com/qwqgong-ui/mmmmmmhhhmmm'
+license=('GPL-3.0-only')
+depends=('glibc' 'nftables' 'iproute2' 'python' 'python-yaml' 'systemd')
+makedepends=('go' 'git' 'make')
+provides=("mihomo-bin=$epoch:$pkgver" 'clash-meta')
+conflicts=('mihomo-bin' 'mihomo-tproxy')
+options=('!strip' '!debug')
+install=mihomo.install
+source=('manage.py' 'tproxy.toml' 'direct4.cidr' 'direct6.cidr' '50-tproxy.conf' 'config.yaml')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+backup=('etc/mihomo/config.yaml' 'etc/mihomo/tproxy.toml' 'etc/mihomo/direct4.cidr' 'etc/mihomo/direct6.cidr')
+
+pkgver() {
+    printf 'dev.r%s' "$(git -C "$startdir/../../.." rev-parse --short HEAD)"
+}
+
+build() {
+    GOMAXPROCS=3 GOTOOLCHAIN=local make -C "$startdir/../../.." linux-amd64-v3
+}
+
+check() {
+    cd "$startdir"
+    python -B -m unittest discover -s tests
+}
+
+package() {
+    install -Dm755 "$startdir/../../../bin/mihomo-linux-amd64-v3" "$pkgdir/usr/bin/mihomo"
+    install -Dm644 "$srcdir/config.yaml" "$pkgdir/etc/mihomo/config.yaml"
+    install -Dm644 "$startdir/../../../.github/release/mihomo.service" "$pkgdir/usr/lib/systemd/system/mihomo.service"
+    install -Dm644 "$startdir/../../../.github/release/mihomo@.service" "$pkgdir/usr/lib/systemd/system/mihomo@.service"
+    install -Dm755 "$srcdir/manage.py" "$pkgdir/usr/lib/mihomo-tproxy/manage"
+    install -Dm644 "$srcdir/50-tproxy.conf" "$pkgdir/usr/lib/systemd/system/mihomo.service.d/50-tproxy.conf"
+    for config in tproxy.toml direct4.cidr direct6.cidr; do
+        install -Dm644 "$srcdir/$config" "$pkgdir/etc/mihomo/$config"
+    done
+}

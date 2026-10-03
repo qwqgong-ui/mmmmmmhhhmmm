@@ -1,0 +1,4 @@
+# One explicitly direct real IPv4 address or CIDR per line.
+# Populate only destinations that must never need Mihomo rules.
+# Example (documentation network; uncomment only for testing):
+# 203.0.113.0/24
