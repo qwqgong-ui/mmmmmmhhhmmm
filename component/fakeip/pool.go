@@ -78,6 +78,11 @@ func (p *Pool) LookupWithError(host string) (netip.Addr, error) {
 
 // LookBack return host with the fake ip
 func (p *Pool) LookBack(ip netip.Addr) (string, bool) {
+	// Real addresses cannot have a mapping in this pool. Reject them before
+	// entering the persistent store or taking the in-memory allocation lock.
+	if !p.ipnet.Contains(ip) {
+		return "", false
+	}
 	if _, persistent := p.store.(*cachefileStore); persistent {
 		return p.store.GetByIP(ip)
 	}
@@ -89,6 +94,9 @@ func (p *Pool) LookBack(ip netip.Addr) (string, bool) {
 
 // Exist returns if given ip exists in fake-ip pool
 func (p *Pool) Exist(ip netip.Addr) bool {
+	if !p.ipnet.Contains(ip) {
+		return false
+	}
 	if _, persistent := p.store.(*cachefileStore); persistent {
 		return p.store.Exist(ip)
 	}
