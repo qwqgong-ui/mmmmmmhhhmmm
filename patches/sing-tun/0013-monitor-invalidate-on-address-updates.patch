@@ -1,0 +1,98 @@
+diff --git a/monitor_linux.go b/monitor_linux.go
+--- a/monitor_linux.go
++++ b/monitor_linux.go
+@@ -17,6 +17,7 @@
+ type networkUpdateMonitor struct {
+ 	routeUpdate chan netlink.RouteUpdate
+ 	linkUpdate  chan netlink.LinkUpdate
++	addrUpdate  chan netlink.AddrUpdate
+ 	close       chan struct{}
+ 
+ 	access    sync.Mutex
+@@ -34,6 +35,7 @@
+ 	monitor := &networkUpdateMonitor{
+ 		routeUpdate: make(chan netlink.RouteUpdate, 2),
+ 		linkUpdate:  make(chan netlink.LinkUpdate, 2),
++		addrUpdate:  make(chan netlink.AddrUpdate, 2),
+ 		close:       make(chan struct{}),
+ 		logger:      logger,
+ 	}
+@@ -63,9 +65,31 @@
+ 	if err != nil {
+ 		return err
+ 	}
++	err = netlink.AddrSubscribe(m.addrUpdate, m.close)
++	if err != nil {
++		_ = m.Close()
++		return err
++	}
++	// Address identity can change without a route/link change. Do not hold
++	// these invalidations behind the route monitor's one-second throttle.
++	go m.loopAddressUpdate()
+ 	go m.loopUpdate()
+ 	return nil
+ }
+ 
++func (m *networkUpdateMonitor) loopAddressUpdate() {
++	for {
++		select {
++		case <-m.close:
++			return
++		case _, ok := <-m.addrUpdate:
++			if !ok {
++				return
++			}
++			m.emit()
++		}
++	}
++}
++
+ func (m *networkUpdateMonitor) loopUpdate() {
+ 	const minDuration = time.Second
+diff --git a/monitor_address_update_test.go b/monitor_address_update_test.go
+new file mode 100644
+--- /dev/null
++++ b/monitor_address_update_test.go
+@@ -0,0 +1,42 @@
++//go:build linux
++
++package tun
++
++import (
++	"testing"
++	"time"
++
++	"github.com/sagernet/netlink"
++)
++
++func TestAddressUpdatesInvalidateWithoutRouteThrottle(t *testing.T) {
++	m := &networkUpdateMonitor{addrUpdate: make(chan netlink.AddrUpdate), close: make(chan struct{})}
++	events := make(chan struct{}, 100)
++	m.RegisterCallback(func() { events <- struct{}{} })
++	done := make(chan struct{})
++	go func() { defer close(done); m.loopAddressUpdate() }()
++	for i := 0; i < 100; i++ {
++		select {
++		case m.addrUpdate <- netlink.AddrUpdate{}:
++		case <-time.After(time.Second):
++			t.Fatal("address update throttled")
++		}
++	}
++	for i := 0; i < 100; i++ {
++		select {
++		case <-events:
++		case <-time.After(time.Second):
++			t.Fatal("address invalidation lost")
++		}
++	}
++	if err := m.Close(); err != nil { t.Fatal(err) }
++	select { case <-done: case <-time.After(time.Second): t.Fatal("address monitor leaked") }
++}
++
++func TestAddressUpdateChannelClosureStopsLoop(t *testing.T) {
++	m := &networkUpdateMonitor{addrUpdate: make(chan netlink.AddrUpdate), close: make(chan struct{})}
++	close(m.addrUpdate)
++	done := make(chan struct{})
++	go func() { defer close(done); m.loopAddressUpdate() }()
++	select { case <-done: case <-time.After(time.Second): t.Fatal("closed address channel spins") }
++}

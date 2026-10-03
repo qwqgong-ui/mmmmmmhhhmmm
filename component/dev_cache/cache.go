@@ -41,6 +41,7 @@ type Result[V any] struct {
 type flight[V any] struct {
 	done   chan struct{}
 	result Result[V]
+	cancel context.CancelFunc
 }
 
 type Cache[K comparable, V any] struct {
@@ -120,14 +121,31 @@ func (c *Cache[K, V]) ComputeWithExpire(key K, f func(V, time.Time, bool) (V, ti
 	c.data.SetWithExpire(key, v, due)
 	return v, true
 }
-func (c *Cache[K, V]) delete(key K) { c.data.Delete(key); delete(c.retry, key); delete(c.flights, key) }
+
+// invalidateFlight must hold mu. Publish the invalidation before waking every
+// waiter; an old worker may ignore cancellation, but cannot publish again.
+func (c *Cache[K, V]) invalidateFlight(key K) {
+	if f := c.flights[key]; f != nil {
+		delete(c.flights, key)
+		f.result = Result[V]{Err: ErrInvalidated}
+		f.cancel()
+		close(f.done)
+	}
+}
+func (c *Cache[K, V]) delete(key K) {
+	c.data.Delete(key)
+	delete(c.retry, key)
+	c.invalidateFlight(key)
+}
 func (c *Cache[K, V]) Delete(key K) { c.mu.Lock(); defer c.mu.Unlock(); c.delete(key) }
 func (c *Cache[K, V]) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.data.Clear()
 	clear(c.retry)
-	clear(c.flights)
+	for key := range c.flights {
+		c.invalidateFlight(key)
+	}
 }
 func (c *Cache[K, V]) snapshot() (out []Item[K, V]) {
 	switch data := c.data.(type) {
@@ -156,7 +174,7 @@ func (c *Cache[K, V]) DeleteMatching(match func(K) bool) int {
 	// A retired scope must not be resurrected by an outstanding cold lookup.
 	for k := range c.flights {
 		if match(k) {
-			delete(c.flights, k)
+			c.invalidateFlight(k)
 		}
 	}
 	return n
@@ -175,7 +193,7 @@ func (c *Cache[K, V]) MarkStale(match func(K) bool) {
 	}
 	for key := range c.flights {
 		if match(key) {
-			delete(c.flights, key)
+			c.invalidateFlight(key)
 		}
 	}
 }
@@ -197,11 +215,11 @@ func (c *Cache[K, V]) Refresh(key K, timeout time.Duration, fetch func(context.C
 				return func(context.Context) (V, error) { return v, nil }
 			}
 		}
-		f = &flight[V]{done: make(chan struct{})}
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		f = &flight[V]{done: make(chan struct{}), cancel: cancel}
 		c.flights[key] = f
 		diagstats.Add(diagstats.CacheRefreshStarted)
 		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), timeout)
 			defer cancel()
 			v, due, err := fetch(ctx)
 			c.mu.Lock()
@@ -219,9 +237,9 @@ func (c *Cache[K, V]) Refresh(key K, timeout time.Duration, fetch func(context.C
 					retained = true
 					c.retry[key] = time.Now().Add(RetryDelay)
 				}
+				f.result = Result[V]{v, err}
+				close(f.done)
 			}
-			f.result = Result[V]{v, err}
-			close(f.done)
 			kind := c.kind
 			c.mu.Unlock()
 			event := "refresh_succeeded"

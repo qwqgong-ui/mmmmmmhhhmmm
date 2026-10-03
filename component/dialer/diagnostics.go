@@ -17,6 +17,9 @@ func logDirectAttempt(host, port, scope string, ip netip.Addr, rtt time.Duration
 		return
 	}
 	reason := "connected"
+	if err == nil && rtt == 0 {
+		reason = "tfo_deferred"
+	}
 	var netErr net.Error
 	switch {
 	case errors.Is(err, context.Canceled):
@@ -28,5 +31,10 @@ func logDirectAttempt(host, port, scope string, ip netip.Addr, rtt time.Duration
 	case err != nil:
 		reason = "connect_error"
 	}
-	log.Fields(log.DEBUG, map[string]string{"subsystem": "direct", "event": "tcp_attempt", "host": host, "network_scope": scope, "reason": reason, "latency_ms": fmt.Sprint(float64(rtt) / float64(time.Millisecond))}, "DIRECT TCP %s:%s candidate=%s cached=%t RTT=%s result=%s error=%v", host, port, ip, cached, rtt, reason, err)
+	fields := map[string]string{"subsystem": "direct", "event": "tcp_attempt", "host": host, "network_scope": scope, "reason": reason, "rtt_known": "false"}
+	if rtt > 0 {
+		fields["rtt_known"] = "true"
+		fields["latency_ms"] = fmt.Sprint(float64(rtt) / float64(time.Millisecond))
+	}
+	log.Fields(log.DEBUG, fields, "DIRECT TCP %s:%s candidate=%s cached=%t RTT=%s result=%s error=%v", host, port, ip, cached, rtt, reason, err)
 }

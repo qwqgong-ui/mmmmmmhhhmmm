@@ -318,17 +318,22 @@ func NewConn(c net.Conn, a C.ProxyAdapter) C.Conn {
 
 type packetConn struct {
 	N.EnhancePacketConn
-	chain       C.Chain
-	pdChain     C.Chain
-	adapterName string
-	connID      string
-	adapterAddr string
-	resolveUDP  func(ctx context.Context, metadata *C.Metadata) error
+	chain                C.Chain
+	pdChain              C.Chain
+	adapterName          string
+	connID               string
+	adapterAddr          string
+	resolveUDP           func(ctx context.Context, metadata *C.Metadata) error
+	concurrentResolveUDP bool
 }
 
 func (c *packetConn) ResolveUDP(ctx context.Context, metadata *C.Metadata) error {
 	return c.resolveUDP(ctx, metadata)
 }
+
+// DIRECT protects its target registration and permits independent DNS work.
+// Other adapters retain a single preparation worker unless they opt in.
+func (c *packetConn) ConcurrentResolveUDP() bool { return c.concurrentResolveUDP }
 
 func (c *packetConn) RemoteDestination() string {
 	host, _, _ := net.SplitHostPort(c.adapterAddr)
@@ -386,7 +391,7 @@ func newPacketConn(pc net.PacketConn, a ProxyAdapter, resolveUDP func(context.Co
 	default:
 		epc = N.NewDeadlineEnhancePacketConn(epc) // most conn from outbound can't handle readDeadline correctly
 	}
-	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), resolveUDP}
+	cpc := &packetConn{epc, nil, nil, a.Name(), utils.NewUUIDV4().String(), a.Addr(), resolveUDP, a.Type() == C.Direct}
 	cpc.AppendToChains(a)
 	return cpc
 }

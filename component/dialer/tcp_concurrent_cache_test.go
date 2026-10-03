@@ -333,7 +333,6 @@ func TestTCPConcurrentFastPathErrorFallsBackImmediately(t *testing.T) {
 		ipA: {{release: blocked}},
 		ipB: {
 			{release: closedTestGate(), err: errors.New("cached address failed")},
-			{release: blocked},
 		},
 		ipC: {{release: closedTestGate()}},
 	})
@@ -344,7 +343,7 @@ func TestTCPConcurrentFastPathErrorFallsBackImmediately(t *testing.T) {
 	}
 	_ = result.Conn.Close()
 	waitForAttemptCount(t, dialer, ipA, 1)
-	waitForAttemptCount(t, dialer, ipB, 2)
+	waitForAttemptCount(t, dialer, ipB, 1)
 	waitForAttemptCount(t, dialer, ipC, 1)
 	releaseBlocked()
 	if winner, loaded := cache.Get(key); !loaded || winner != ipC {
@@ -352,7 +351,7 @@ func TestTCPConcurrentFastPathErrorFallsBackImmediately(t *testing.T) {
 	}
 }
 
-func TestTCPConcurrentFastPathTimeoutFallsBackToAllCandidates(t *testing.T) {
+func TestTCPConcurrentFastPathTimeoutKeepsOriginalAttempt(t *testing.T) {
 	cache := installTestTCPConcurrentCache(t)
 	blocked := make(chan struct{})
 	var releaseOnce sync.Once
@@ -367,7 +366,6 @@ func TestTCPConcurrentFastPathTimeoutFallsBackToAllCandidates(t *testing.T) {
 		ipA: {{release: blocked}},
 		ipB: {
 			{release: nil},
-			{release: blocked},
 		},
 		ipC: {{release: closedTestGate()}},
 	})
@@ -405,7 +403,7 @@ func TestTCPConcurrentFastPathTimeoutFallsBackToAllCandidates(t *testing.T) {
 		t.Fatalf("fallback started too early: %s", elapsed)
 	}
 	waitForAttemptCount(t, dialer, ipA, 1)
-	waitForAttemptCount(t, dialer, ipB, 2)
+	waitForAttemptCount(t, dialer, ipB, 1)
 	waitForAttemptCount(t, dialer, ipC, 1)
 	releaseBlocked()
 	if winner, loaded := cache.Get(key); !loaded || winner != ipC {

@@ -230,11 +230,12 @@ func runProgressiveDirectRace(
 			connectOpt.tfo = false
 			started := time.Now()
 			conn, err := dialContext(ctx, network, ip, port, connectOpt)
-			logDirectAttempt(host, port, scope, ip, time.Since(started), err, false)
+			duration := measuredDialDuration(started)
+			logDirectAttempt(host, port, scope, ip, duration, err, false)
 			result := progressiveConnectResult{
 				dialResult: dialResult{ip: ip, Conn: conn, error: err},
 				ipv6:       ipv6,
-				rtt:        measuredDialDuration(started),
+				rtt:        duration,
 			}
 			select {
 			case connects <- result:
@@ -300,14 +301,18 @@ func runProgressiveDirectRace(
 			go func() {
 				started := time.Now()
 				conn, err := dialContext(ctx, network, winner.IP, port, connectOpt)
-				logDirectAttempt(host, port, scope, winner.IP, time.Since(started), err, true)
+				duration := time.Duration(0)
+				if measureLatency {
+					duration = measuredDialDuration(started)
+				}
+				logDirectAttempt(host, port, scope, winner.IP, duration, err, true)
 				result := progressiveConnectResult{
 					dialResult: dialResult{ip: winner.IP, Conn: conn, error: err},
 					ipv6:       ipv6,
 					fast:       true,
 				}
 				if measureLatency {
-					result.rtt = measuredDialDuration(started)
+					result.rtt = duration
 				}
 				select {
 				case connects <- result:
@@ -436,6 +441,18 @@ func runProgressiveDirectRace(
 				start(ip, event.ipv6)
 			}
 		case result := <-connects:
+			if ctx.Err() != nil {
+				if result.Conn != nil {
+					_ = result.Conn.Close()
+				}
+				if heldFallback != nil {
+					_ = heldFallback.Close()
+				}
+				if !delivered {
+					sendResult(dialResult{error: ctx.Err()})
+				}
+				return
+			}
 			pending--
 			if result.ipv6 {
 				pendingFamily[1]--
@@ -467,7 +484,11 @@ func runProgressiveDirectRace(
 				// settled: a winner that never answers would otherwise stay
 				// cached forever, costing a wasted connect on every dial,
 				// because a black hole never reports an error to remove it.
-				log.Debugln("[TCP] progressive direct cached connect ready %s:%s --> %s in %s", host, port, result.ip, result.rtt)
+				if result.rtt > 0 {
+					log.Debugln("[TCP] progressive direct cached connect ready %s:%s --> %s in %s", host, port, result.ip, result.rtt)
+				} else {
+					log.Debugln("[TCP] progressive direct cached lazy connection returned %s:%s --> %s; handshake deferred until write", host, port, result.ip)
+				}
 				promote(result)
 				if heldFallback != nil {
 					_ = heldFallback.Close()
@@ -516,6 +537,9 @@ func runProgressiveDirectRace(
 				heldFallback = nil
 			}
 		case <-fastTimeout:
+			if ctx.Err() != nil {
+				continue
+			}
 			// Whatever has not answered by now does not deserve to be tried
 			// first again, whether or not one of its peers already won.
 			for _, ip := range fastInFlight {

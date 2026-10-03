@@ -20,7 +20,9 @@ var (
 		sync.Mutex
 		entries map[observable.Subscription[Event]]logSubscriber
 	}{entries: make(map[observable.Subscription[Event]]logSubscriber)}
-	dropped atomic.Uint64
+	dropped            atomic.Uint64
+	debugOutputDropped atomic.Uint64
+	debugOutput        = make(chan Event, 256)
 )
 
 type logSubscriber struct {
@@ -38,6 +40,11 @@ func init() {
 		TimestampFormat:           "2006-01-02T15:04:05.000000000Z07:00",
 		EnvironmentOverrideColors: true,
 	})
+	go func() {
+		for event := range debugOutput {
+			print(event)
+		}
+	}()
 }
 
 type Event struct {
@@ -101,7 +108,19 @@ func Fields(logLevel LogLevel, fields map[string]string, format string, v ...any
 		}
 		subscribers.Unlock()
 	}
-	print(event)
+	if logLevel == DEBUG {
+		// Subscriber delivery above is already nonblocking. Console I/O must
+		// not hold up the query/connection that produced diagnostic output.
+		if event.LogLevel >= Level() {
+			select {
+			case debugOutput <- event:
+			default:
+				debugOutputDropped.Add(1)
+			}
+		}
+	} else {
+		print(event)
+	}
 }
 
 func Fatalln(format string, v ...any) {
@@ -132,7 +151,8 @@ func updateSubscriberLevelLocked() {
 	subscriberLevel.Store(int32(l))
 }
 
-func DroppedEvents() uint64 { return dropped.Load() }
+func DroppedEvents() uint64      { return dropped.Load() }
+func DroppedDebugOutput() uint64 { return debugOutputDropped.Load() }
 
 func UnSubscribe(sub observable.Subscription[Event]) {
 	subscribers.Lock()
@@ -168,7 +188,13 @@ func print(data Event) {
 		for k, v := range data.Fields {
 			fields[k] = v
 		}
-		output = log.WithFields(fields)
+		entry := log.WithFields(fields)
+		if data.LogLevel == DEBUG {
+			entry = entry.WithTime(data.Time)
+		}
+		output = entry
+	} else if data.LogLevel == DEBUG {
+		output = log.WithTime(data.Time)
 	}
 	switch data.LogLevel {
 	case INFO:

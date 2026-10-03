@@ -59,7 +59,7 @@ func getServerCapabilities(w http.ResponseWriter, r *http.Request) {
 	render.JSON(w, r, render.M{"nodes": dns.CapabilitySnapshots(), "unknownNodes": "nodes not listed have not been tested; unknown is not confirmed support"})
 }
 func getDownstreamStats(w http.ResponseWriter, r *http.Request) {
-	render.JSON(w, r, render.M{"counters": diagstats.Snapshot(), "hybridQuic": hybrid.Stats(), "logSubscriberDrops": log.DroppedEvents(), "lifetime": "process", "coverage": "named counters only; absent subsystems are not measured"})
+	render.JSON(w, r, render.M{"counters": diagstats.Snapshot(), "hybridQuic": hybrid.Stats(), "logSubscriberDrops": log.DroppedEvents(), "debugOutputDrops": log.DroppedDebugOutput(), "lifetime": "process", "coverage": "named counters only; absent subsystems are not measured"})
 }
 
 func diagnosticTarget(host, portText string) (string, uint16, error) {

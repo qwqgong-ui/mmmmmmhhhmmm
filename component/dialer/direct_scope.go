@@ -3,7 +3,10 @@ package dialer
 import (
 	"net"
 	"net/netip"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/component/dev_cache"
@@ -35,8 +38,73 @@ type NetworkStatus struct {
 }
 
 func CurrentNetworkStatus() NetworkStatus {
-	name := currentInterfaceName("")
-	status := NetworkStatus{Interface: name, NetworkScope: directNetworkScope(option{})}
+	status := cachedNetworkStatus(currentInterfaceName(""))
+	if environment := directNetworkEnvironment.Load(); environment != "" {
+		status.NetworkScope = EnvironmentScope(environment)
+	}
+	return status
+}
+
+// Events invalidate immediately. The bounded age also covers unavailable
+// monitors and address updates that an embedding platform does not report.
+const networkStatusMaxAge = 250 * time.Millisecond
+
+type networkStatusSample struct {
+	status     NetworkStatus
+	generation uint64
+	due        time.Time
+}
+
+var networkStatusCache = struct {
+	sync.Mutex
+	entries map[string]networkStatusSample
+	loading map[string]chan struct{}
+}{entries: make(map[string]networkStatusSample), loading: make(map[string]chan struct{})}
+
+var readNetworkStatus = sampleNetworkStatus
+
+func cachedNetworkStatus(name string) NetworkStatus {
+	for changes := 0; changes < 2; {
+		networkStatusCache.Lock()
+		now := time.Now()
+		generation := NetworkGeneration()
+		entry, hit := networkStatusCache.entries[name]
+		if hit && entry.generation == generation && now.Before(entry.due) {
+			networkStatusCache.Unlock()
+			return entry.status
+		}
+		if loading := networkStatusCache.loading[name]; loading != nil {
+			networkStatusCache.Unlock()
+			<-loading
+			if NetworkGeneration() != generation {
+				changes++
+			}
+			continue
+		}
+		done := make(chan struct{})
+		networkStatusCache.loading[name] = done
+		networkStatusCache.Unlock()
+		status := readNetworkStatus(name)
+		networkStatusCache.Lock()
+		delete(networkStatusCache.loading, name)
+		close(done)
+		if generation != NetworkGeneration() {
+			networkStatusCache.Unlock()
+			changes++
+			continue
+		}
+		if len(networkStatusCache.entries) >= 16 {
+			clear(networkStatusCache.entries)
+		}
+		networkStatusCache.entries[name] = networkStatusSample{status, generation, time.Now().Add(networkStatusMaxAge)}
+		networkStatusCache.Unlock()
+		return status
+	}
+	return NetworkStatus{Interface: name, NetworkScope: "network-transition|" + name + "|" + strconv.FormatUint(NetworkGeneration(), 10), Reason: "network_changed_during_sample"}
+}
+
+func sampleNetworkStatus(name string) NetworkStatus {
+	status := NetworkStatus{Interface: name, NetworkScope: dev_cache.DesktopScope(nil)}
 	if name == "" {
 		status.Reason = "physical_interface_unknown"
 		return status
@@ -52,11 +120,13 @@ func CurrentNetworkStatus() NetworkStatus {
 		return status
 	}
 	status.AddressesKnown = true
+	prefixes := make([]netip.Prefix, 0, len(addresses))
 	for _, address := range addresses {
 		prefix, err := netip.ParsePrefix(address.String())
 		if err != nil {
 			continue
 		}
+		prefixes = append(prefixes, prefix)
 		ip := prefix.Addr()
 		if ip.IsLoopback() || ip.IsLinkLocalUnicast() {
 			continue
@@ -67,6 +137,7 @@ func CurrentNetworkStatus() NetworkStatus {
 			status.IPv6 = true
 		}
 	}
+	status.NetworkScope = scopeForPrefixes(name, prefixes)
 	return status
 }
 
@@ -100,28 +171,7 @@ func directNetworkScope(opt option) string {
 	if environment := directNetworkEnvironment.Load(); environment != "" {
 		return environmentScopePrefix + environment
 	}
-	interfaceName := currentInterfaceName(opt.interfaceName)
-	if interfaceName == "" {
-		return dev_cache.DesktopScope(nil)
-	}
-
-	iface, err := net.InterfaceByName(interfaceName)
-	if err != nil {
-		return dev_cache.DesktopScope(nil)
-	}
-	addresses, err := iface.Addrs()
-	if err != nil {
-		return dev_cache.DesktopScope(nil)
-	}
-	prefixes := make([]netip.Prefix, 0, len(addresses))
-	for _, address := range addresses {
-		prefix, err := netip.ParsePrefix(address.String())
-		if err != nil {
-			continue
-		}
-		prefixes = append(prefixes, prefix)
-	}
-	return scopeForPrefixes(interfaceName, prefixes)
+	return cachedNetworkStatus(currentInterfaceName(opt.interfaceName)).NetworkScope
 }
 
 func currentInterfaceName(configured string) string {

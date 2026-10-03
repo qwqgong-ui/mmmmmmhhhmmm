@@ -70,9 +70,11 @@ func logUDPResolveFailure(host string, err error) {
 }
 
 type packetSender struct {
-	ctx    context.Context
-	cancel context.CancelFunc
-	ch     chan C.PacketAdapter
+	ctx       context.Context
+	cancel    context.CancelFunc
+	ch        chan C.PacketAdapter
+	slots     chan struct{}
+	sendMutex sync.RWMutex
 
 	// UDP destination-identity mapping.
 	//
@@ -83,6 +85,7 @@ type packetSender struct {
 	// future protocol debugging does not accidentally turn ambiguity into a
 	// wrong TUN source address.
 	originToTarget        map[string]M.Socksaddr
+	preparedTargets       map[udpPrepareKey]M.Socksaddr
 	targetToOrigin        map[netip.Addr]netip.Addr // exact locally-resolved IP -> origin
 	remoteDomains         map[string]*remoteDomainTarget
 	learnedTargetToOrigin map[netip.Addr]netip.Addr // HY2 real IP -> attributed origin
@@ -99,8 +102,10 @@ func newPacketSender() C.PacketSender {
 		ctx:    ctx,
 		cancel: cancel,
 		ch:     ch,
+		slots:  make(chan struct{}, senderCapacity),
 
 		originToTarget:        make(map[string]M.Socksaddr),
+		preparedTargets:       make(map[udpPrepareKey]M.Socksaddr),
 		targetToOrigin:        make(map[netip.Addr]netip.Addr),
 		remoteDomains:         make(map[string]*remoteDomainTarget),
 		learnedTargetToOrigin: make(map[netip.Addr]netip.Addr),
@@ -146,6 +151,10 @@ func (s *packetSender) AddMapping(originMetadata *C.Metadata, metadata *C.Metada
 	originKey := originMetadata.String()
 	originAddr := originMetadata.DstIP.Unmap()
 	target := udpDestination(metadata)
+	key := udpPacketKey(originMetadata)
+	if !s.preparedTargets[key].IsValid() && target.IsValid() {
+		s.preparedTargets[key] = target
+	}
 	if addr := s.originToTarget[originKey]; !addr.IsValid() && target.IsValid() { // overwrite only if the record is illegal
 		s.originToTarget[originKey] = target
 	}
@@ -291,7 +300,7 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 	var addr net.Addr
 
 	s.mappingMutex.RLock()
-	targetAddr := s.originToTarget[metadata.String()]
+	targetAddr := s.preparedTargets[udpPacketKey(metadata)]
 	s.mappingMutex.RUnlock()
 
 	if targetAddr.IsValid() {
@@ -314,8 +323,7 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 		_ = preHandleMetadata(metadata) // error was pre-checked
 		metadata = metadata.Pure()
 		if metadata.Host != "" {
-			// TODO: ResolveUDP may take a long time to block the Process loop
-			//       but we want keep sequence sending so can't open a new goroutine
+			// Direct callers outside Process still prepare synchronously.
 			if err := pc.ResolveUDP(s.ctx, metadata); err != nil {
 				logUDPResolveFailure(metadata.Host, err)
 				return
@@ -344,6 +352,9 @@ func (s *packetSender) processPacket(pc C.PacketConn, packet C.PacketAdapter) {
 // the sender is talking to a tun device that took the packet, so it keeps
 // sending the same size, or waits out a timeout.
 func reportUDPICMPError(packet C.UDPPacket, addr net.Addr, err error) {
+	if queued, ok := packet.(*queuedUDPPacket); ok {
+		packet = queued.PacketAdapter
+	}
 	reporter, canReport := packet.(C.UDPPacketICMPError)
 	if !canReport {
 		return
@@ -435,17 +446,7 @@ func addrIs6(addr net.Addr) (bool, bool) {
 }
 
 func (s *packetSender) Process(pc C.PacketConn, proxy C.WriteBackProxy) {
-	for {
-		select {
-		case <-s.ctx.Done():
-			return // sender closed
-		case packet := <-s.ch:
-			if proxy != nil {
-				proxy.UpdateWriteBack(packet)
-			}
-			s.processPacket(pc, packet)
-		}
-	}
+	s.processPreparedPackets(pc, proxy)
 }
 
 func (s *packetSender) dropAll() {
@@ -460,11 +461,20 @@ func (s *packetSender) dropAll() {
 }
 
 func (s *packetSender) Send(packet C.PacketAdapter) {
+	s.sendMutex.RLock()
+	defer s.sendMutex.RUnlock()
 	select {
 	case <-s.ctx.Done():
 		packet.Drop() // sender closed before Send()
 		return
 	default:
+	}
+	select {
+	case s.slots <- struct{}{}:
+		packet = &queuedUDPPacket{PacketAdapter: packet, slots: s.slots}
+	default:
+		packet.Drop()
+		return
 	}
 
 	select {
@@ -478,6 +488,8 @@ func (s *packetSender) Send(packet C.PacketAdapter) {
 }
 
 func (s *packetSender) Close() {
+	s.sendMutex.Lock()
+	defer s.sendMutex.Unlock()
 	s.cancel()
 	s.dropAll()
 }

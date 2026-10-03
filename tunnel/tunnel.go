@@ -704,11 +704,12 @@ func handleTCPConn(connCtx C.ConnContext) {
 	peekMutex := sync.Mutex{}
 	if !conn.Peeked() {
 		peekMutex.Lock()
+		// Set this before starting the reader: a later immediate deadline must
+		// never be overwritten by the peek goroutine.
+		_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 		go func() {
 			defer peekMutex.Unlock()
-			_ = conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
 			_, _ = conn.Peek(1)
-			_ = conn.SetReadDeadline(time.Time{})
 		}()
 	}
 
@@ -746,7 +747,6 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}
 	}
 
-	var peekBytes []byte
 	var peekLen int
 
 	ctx, cancel := context.WithTimeout(context.Background(), C.DefaultTCPTimeout)
@@ -768,16 +768,9 @@ func handleTCPConn(connCtx C.ConnContext) {
 					remoteConn = nil
 				}
 			}()
-			peekMutex.Lock()
-			defer peekMutex.Unlock()
-			peekBytes, _ = conn.Peek(conn.Buffered())
-			_, err = remoteConn.Write(peekBytes)
-			if err != nil {
-				return
-			}
-			if peekLen = len(peekBytes); peekLen > 0 {
-				_, _ = conn.Discard(peekLen)
-			}
+			// The outbound is ready to send its protocol handshake. Use bytes
+			// already buffered, without waiting for a server-first client to write.
+			peekLen, err = writeBufferedHandshake(conn, &peekMutex, remoteConn)
 		}
 		return
 	}, func(err error) {

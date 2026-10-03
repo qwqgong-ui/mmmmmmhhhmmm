@@ -10,7 +10,7 @@ External controller 提供以下诊断接口；配置 `secret` 时均要求 Bear
 - `GET /direct/winners[?host=]`：TCP winner/RTT/scope，以及经 QUIC server CID + 1-RTT 确认的 UDP/QUIC warm winner。
 - `GET /hybrid-quic/stats`：当前 registering/tunnel/probing/raw 数量与生命周期累计值。successRate = 曾进入 raw 的 flow 数 / 已开始的 flow 数；fallback 原因每个 flow 只计第一次，关闭后不保留活动记录。`counters` 是活动 flow 与已关闭 flow 计数之和。
 - `GET /hybrid-quic/flows[?host=&port=&proxy=]`：活动 flow 的状态、目标、raw endpoint、raw socket 是否已连接、应用数据 idle 时间、probe 次数和最近一次 fallback 原因（回到 raw 时清空，`rawPermanent` 表示是否还能恢复）。keepalive 不刷新应用 idle。`counters` 分 raw 与 stream 两条路径统计收发包数和字节数，另有来源不符、非短包头或首次 raw 回包使用未知客户端 CID 而丢弃的数据报数、raw socket 收到的 ICMP 差错数、回到可靠流的次数和进入 raw 的次数（超过 1 即为恢复）；短包头的包号是加密的，客户端无法据此统计 raw 的丢包或乱序。
-- `GET /stats/downstream`：已接入的 DNS、DIRECT TCP、ICMP 报告、进程归属累计计数，另含 Hybrid 计数和慢日志订阅者丢弃数。计数随进程重启归零，不代表所有下游功能均已埋点。
+- `GET /stats/downstream`：已接入的 DNS、DIRECT TCP、ICMP 报告、进程归属累计计数，另含 Hybrid 计数、慢日志订阅者丢弃数 `logSubscriberDrops` 和控制台 DEBUG 丢弃数 `debugOutputDrops`。计数随进程重启归零，不代表所有下游功能均已埋点。
 - `GET /debug/path?host=example.com&port=443&network=tcp`：默认不发起 DNS 或目标连接，汇总规则预览、缓存来源、ECS、真实候选、缓存中的 HTTPS/SVCB/ECH 摘要、winner 与该目标的 Hybrid 活动状态。
 
 ## 主动检查与结果边界
@@ -33,3 +33,5 @@ ECH 仅表示是否携带配置，不输出密钥材料，也不证明握手成�
 控制台 INFO 与 `/logs?level=debug` 独立；仅有 DEBUG 消费者时才启用详细诊断。新增昂贵 DEBUG 参数受 Enabled 检查保护，无消费者时不构造详情；普通连接的既有日志保持兼容。慢订阅者使用有界队列，丢弃事件而不阻塞转发；HTTP 取消和 WebSocket 关闭会释放订阅。没有新增周期探测或诊断定时器，计数使用固定原子变量；快照按 API 请求生成。
 
 这些措施限制软件层面的额外成本，不等于已完成设备功耗测试。尚未覆盖的细粒度信息包括所有 DIRECT QUIC CID 分歧/确认超时原因、ICMP 底层最终写入的 type/code，以及全部下游功能的 hit/miss 计数；接口不伪造这些数据。
+
+控制台 DEBUG 由单个 worker 输出，队列最多 256 条；队满时计数并丢弃，网络处理不等待控制台写入。事件在入队前格式化并复制 fields，保留产生时刻。INFO/WARNING/ERROR 的同步输出及订阅接口保持原语义。DIRECT RTT 在写日志前测量；TFO 尚未握手时标记 `rtt_known=false`、`reason=tfo_deferred`，不写入假的零耗时样本。
