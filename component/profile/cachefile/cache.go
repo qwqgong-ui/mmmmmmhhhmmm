@@ -28,6 +28,9 @@ var (
 // CacheFile store and update the cache file
 type CacheFile struct {
 	DB *bbolt.DB
+
+	fakeipOnce   [2]sync.Once
+	fakeipStores [2]*FakeIpStore
 }
 
 func (c *CacheFile) SetSelected(group, selected string) {
