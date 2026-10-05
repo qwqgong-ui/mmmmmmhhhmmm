@@ -184,4 +184,5 @@ type Tunnel interface {
 	Providers() map[string]ProxyProvider
 	RuleProviders() map[string]RuleProvider
 	RuleUpdateCallback() *utils.Callback[RuleProvider]
+	InvalidateRejectCache()
 }

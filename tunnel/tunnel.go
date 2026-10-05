@@ -151,6 +151,10 @@ func (t tunnel) RuleUpdateCallback() *utils.Callback[P.RuleProvider] {
 	return ruleUpdateCallback
 }
 
+func (t tunnel) InvalidateRejectCache() {
+	defaultRejectBans.Reset()
+}
+
 func OnSuspend() {
 	status.Store(Suspend)
 }
@@ -171,6 +175,7 @@ func SetSniffing(b bool) {
 	if snifferDispatcher.Enable() {
 		configMux.Lock()
 		sniffingEnable = b
+		defaultRejectBans.Reset()
 		configMux.Unlock()
 	}
 }
@@ -227,6 +232,7 @@ func UpdateRules(newRules []C.Rule, newSubRule map[string][]C.Rule, rp map[strin
 	rules = newRules
 	ruleProviders = rp
 	subRules = newSubRule
+	defaultRejectBans.Reset()
 	configMux.Unlock()
 }
 
@@ -250,6 +256,7 @@ func UpdateProxies(newProxies map[string]C.Proxy, newProviders map[string]P.Prox
 	configMux.Lock()
 	proxies = newProxies
 	providers = newProviders
+	defaultRejectBans.Reset()
 	configMux.Unlock()
 }
 
@@ -263,6 +270,7 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 	configMux.Lock()
 	snifferDispatcher = dispatcher
 	sniffingEnable = dispatcher.Enable()
+	defaultRejectBans.Reset()
 	configMux.Unlock()
 }
 
@@ -274,6 +282,7 @@ func Mode() TunnelMode {
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
 	mode.Store(int32(m))
+	defaultRejectBans.Reset()
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -284,6 +293,7 @@ func FindProcessMode() process.FindProcessMode {
 // always find process info if legacyAlways = true or mode.Always() = true, may be increase many memory
 func SetFindProcessMode(mode process.FindProcessMode) {
 	findProcessMode.Store(mode)
+	defaultRejectBans.Reset()
 }
 
 func isHandle(t C.Type) bool {
@@ -701,6 +711,19 @@ func handleTCPConn(connCtx C.ConnContext) {
 		return
 	}
 
+	banKey, canBan := tcpRejectBanKey(metadata)
+	var banGeneration uint64
+	if canBan {
+		cachedProxy, generation := defaultRejectBans.Lookup(banKey, time.Now())
+		banGeneration = generation
+		if cachedProxy != nil {
+			if rejectBanProxyActive(cachedProxy, metadata) && defaultRejectBans.Current(banGeneration) {
+				return // close immediately, without matching, peeking or logging
+			}
+			defaultRejectBans.Forget(banKey, banGeneration)
+		}
+	}
+
 	peekMutex := sync.Mutex{}
 	if !conn.Peeked() {
 		peekMutex.Lock()
@@ -723,6 +746,15 @@ func handleTCPConn(connCtx C.ConnContext) {
 	// outbound, the traffic tracker and the relay loop entirely.
 	if rejectProxy, chains, isReject := rejectAdapter(proxy, metadata); isReject {
 		logMetadata(metadata, rule, chains)
+		if canBan {
+			if rejectProxy.Type() == C.Reject {
+				if until, started := defaultRejectBans.Reject(banKey, banGeneration, proxy, time.Now()); started {
+					log.Infoln("[TCP] REJECT failban %s --> %s for %s (%d rejects within %s, until %s)", metadata.SourceDetail(), metadata.RemoteAddress(), rejectBanDuration, rejectBanThreshold, rejectBanWindow, until.Format(time.RFC3339))
+				}
+			} else {
+				defaultRejectBans.Forget(banKey, banGeneration)
+			}
+		}
 		_ = conn.SetReadDeadline(time.Now()) // stop unfinished peek
 		peekMutex.Lock()
 		defer peekMutex.Unlock()
@@ -734,6 +766,10 @@ func handleTCPConn(connCtx C.ConnContext) {
 			defaultDropParker.Park(C.DefaultDropTime, func() { _ = conn.Close() })
 		}
 		return
+	}
+
+	if canBan {
+		defaultRejectBans.Forget(banKey, banGeneration)
 	}
 
 	dialMetadata := metadata

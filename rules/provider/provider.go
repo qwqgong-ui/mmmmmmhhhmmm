@@ -132,6 +132,7 @@ func NewRuleSetProvider(name string, behavior P.RuleBehavior, format P.RuleForma
 
 	onUpdate := func(strategy ruleStrategy) {
 		rp.strategy = strategy
+		tunnel.InvalidateRejectCache()
 		tunnel.RuleUpdateCallback().Emit(rp)
 	}
 
