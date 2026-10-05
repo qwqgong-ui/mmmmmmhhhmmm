@@ -26,7 +26,6 @@ func (c *enhanceSingPacketConn) WaitReadFrom() (data []byte, put func(), addr ne
 	var dest M.Socksaddr
 	rwOptions := N.ReadWaitOptions{}
 	if c.packetReadWaiter != nil {
-		c.packetReadWaiter.InitializeReadWaiter(rwOptions)
 		buff, dest, err = c.packetReadWaiter.WaitReadPacket()
 	} else {
 		buff = rwOptions.NewPacketBuffer()
@@ -71,6 +70,7 @@ func (c *enhanceSingPacketConn) ReaderReplaceable() bool {
 func newEnhanceSingPacketConn(conn SingPacketConn) *enhanceSingPacketConn {
 	epc := &enhanceSingPacketConn{SingPacketConn: conn}
 	if readWaiter, isReadWaiter := bufio.CreatePacketReadWaiter(conn); isReadWaiter {
+		readWaiter.InitializeReadWaiter(N.ReadWaitOptions{})
 		epc.packetReadWaiter = readWaiter
 	}
 	return epc

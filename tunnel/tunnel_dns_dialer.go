@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
+	"strings"
 
 	"github.com/metacubex/mihomo/component/tunneldns"
 	C "github.com/metacubex/mihomo/constant"
@@ -115,9 +117,16 @@ func tunnelDNSMatchTarget(queryDomain string) (*C.Metadata, error) {
 	if queryDomain == "" {
 		return nil, errors.New("tunnel DNS needs a domain to select a node with")
 	}
-	match := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
-	if err := match.SetRemoteAddress(net.JoinHostPort(queryDomain, "443")); err != nil {
-		return nil, err
+	match := &C.Metadata{NetWork: C.TCP, Type: C.INNER, DstPort: 443}
+	if strings.ContainsAny(queryDomain, "[]") {
+		// Preserve the existing parser's bracket handling for unusual inputs.
+		if err := match.SetRemoteAddress(net.JoinHostPort(queryDomain, "443")); err != nil {
+			return nil, err
+		}
+	} else if ip, err := netip.ParseAddr(queryDomain); err == nil {
+		match.DstIP = ip.Unmap()
+	} else {
+		match.Host = queryDomain
 	}
 	return match, nil
 }

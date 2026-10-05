@@ -97,6 +97,35 @@ func nextPreparedWrite(t *testing.T, c *preparingTestConn) string {
 		return ""
 	}
 }
+
+func TestUDPPreparedIPTargetsKeepPortAndAddressIdentity(t *testing.T) {
+	for _, ip := range []string{"192.0.2.1", "2001:db8::1", "fe80::1%eth0", "::ffff:192.0.2.1"} {
+		t.Run(ip, func(t *testing.T) {
+			sender := newMappingTestSender(t)
+			origin := udpMetadata(ip, "", 443)
+			sender.AddMapping(origin, udpMetadata("192.0.2.10", "", 443))
+			sender.AddMapping(udpMetadata(ip, "", 8443), udpMetadata("192.0.2.20", "", 8443))
+			conn := &recordingPacketConn{}
+			for _, target := range []struct {
+				port uint16
+				ip   string
+			}{{443, "192.0.2.10"}, {8443, "192.0.2.20"}} {
+				packet := C.NewPacketAdapter(&mappingTestPacket{data: []byte("payload")}, udpMetadata(ip, "", target.port))
+				sender.processPacket(conn, packet)
+				addr, ok := conn.written.(*net.UDPAddr)
+				if !ok || addr.AddrPort() != netip.AddrPortFrom(netip.MustParseAddr(target.ip), target.port) {
+					t.Fatalf("cached destination = %v, want %s:%d", conn.written, target.ip, target.port)
+				}
+			}
+			withHost := udpMetadata(ip, "example.com", 443)
+			changedIP := udpMetadata("192.0.2.99", "example.com", 443)
+			if udpPacketKey(withHost) != udpPacketKey(changedIP) {
+				t.Fatal("a retained host must take precedence over IP changes")
+			}
+		})
+	}
+}
+
 func TestUDPSlowTargetDoesNotBlockPreparedOrConcurrentTargets(t *testing.T) {
 	for _, concurrent := range []bool{false, true} {
 		t.Run(map[bool]string{false: "serialized-resolver", true: "parallel-resolver"}[concurrent], func(t *testing.T) {
@@ -144,7 +173,7 @@ func TestUDPSlowTargetDoesNotBlockPreparedOrConcurrentTargets(t *testing.T) {
 			s.Close()
 			c.mu.Lock()
 			defer c.mu.Unlock()
-			if c.resolutions[udpPrepareKey{"fresh.test", 443}] != 1 || c.resolutions[udpPrepareKey{"fresh.test", 8443}] != 1 {
+			if c.resolutions[udpPacketKey(udpMetadata("", "fresh.test", 443))] != 1 || c.resolutions[udpPacketKey(udpMetadata("", "fresh.test", 8443))] != 1 {
 				t.Fatal(c.resolutions)
 			}
 			if c.overlapping.Load() {

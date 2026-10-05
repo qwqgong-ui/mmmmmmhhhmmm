@@ -3,6 +3,7 @@ package tunnel
 import (
 	"context"
 	"errors"
+	"net/netip"
 	"sync"
 
 	N "github.com/metacubex/mihomo/common/net"
@@ -10,12 +11,16 @@ import (
 )
 
 type udpPrepareKey struct {
-	destination string
-	port        uint16
+	host string
+	ip   netip.Addr
+	port uint16
 }
 
 func udpPacketKey(metadata *C.Metadata) udpPrepareKey {
-	return udpPrepareKey{metadata.String(), metadata.DstPort}
+	if metadata.Host != "" {
+		return udpPrepareKey{host: metadata.Host, port: metadata.DstPort}
+	}
+	return udpPrepareKey{ip: metadata.DstIP, port: metadata.DstPort}
 }
 
 // slots cover input and per-target queues together. Ownership stays with the

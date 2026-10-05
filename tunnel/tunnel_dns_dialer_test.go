@@ -2,12 +2,31 @@ package tunnel
 
 import (
 	"errors"
+	"net"
 	"testing"
 
 	"github.com/metacubex/mihomo/component/tunneldns"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/stretchr/testify/require"
 )
+
+func TestTunnelDNSMatchTargetPreservesAddressParsing(t *testing.T) {
+	for _, host := range []string{"EXAMPLE.com.", "192.0.2.1", "2001:db8::1", "::ffff:192.0.2.1", "fe80::1%eth0", "fe80::1%", "999.0.0.1", "[example.com]", "[::1]", "[", "]", "a:b"} {
+		t.Run(host, func(t *testing.T) {
+			previous := &C.Metadata{NetWork: C.TCP, Type: C.INNER}
+			previousErr := previous.SetRemoteAddress(net.JoinHostPort(host, "443"))
+			metadata, err := tunnelDNSMatchTarget(host)
+			if previousErr != nil {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, previous, metadata)
+		})
+	}
+	_, err := tunnelDNSMatchTarget("")
+	require.Error(t, err)
+}
 
 type tunnelDNSNodeStub struct {
 	name  string

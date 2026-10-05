@@ -1,10 +1,30 @@
 package tunnel
 
 import (
+	"strings"
 	"testing"
+	"time"
 
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
+
+func TestConnectionInfoLogReachesSubscriberWithWarningConsole(t *testing.T) {
+	previous := log.Level()
+	log.SetLevel(log.WARNING)
+	t.Cleanup(func() { log.SetLevel(previous) })
+	subscriber := log.SubscribeLevel(log.INFO)
+	t.Cleanup(func() { log.UnSubscribe(subscriber) })
+	logMetadata(udpMetadata("192.0.2.1", "example.com", 443), nil, C.Chain{"node"})
+	select {
+	case event := <-subscriber:
+		if event.LogLevel != log.INFO || !strings.Contains(event.Payload, "example.com:443") {
+			t.Fatalf("unexpected connection event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("connection INFO event missing from subscriber")
+	}
+}
 
 func TestKeepResolvedFakeIP(t *testing.T) {
 	tests := []struct {

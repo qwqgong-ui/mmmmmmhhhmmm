@@ -76,6 +76,65 @@ func TestDomainBundleAddressFirstNodeIsolationAndExpiry(t *testing.T) {
 	require.Eventually(t, func() bool { return calls.Load() == 3 }, time.Second, time.Millisecond)
 }
 
+func TestDomainBundleCachedRepliesOwnProjectedRecords(t *testing.T) {
+	for _, qtype := range []uint16{D.TypeA, D.TypeAAAA, D.TypeHTTPS} {
+		t.Run(D.TypeToString[qtype], func(t *testing.T) {
+			client := newDomainClient(nil, nil, 10)
+			client.prepare = func(string) (string, func(context.Context) (net.Conn, error), error) {
+				return "projection", nil, nil
+			}
+			cached := &D.Msg{Answer: []D.RR{testServiceRecord(D.TypeHTTPS, "example.com.")}}
+			for _, text := range []string{
+				"EXAMPLE.COM. 60 IN A 192.0.2.1",
+				"example.com. 60 IN AAAA 2001:db8::1",
+				"other.example. 60 IN A 192.0.2.2",
+			} {
+				rr, err := D.NewRR(text)
+				require.NoError(t, err)
+				cached.Extra = append(cached.Extra, rr)
+			}
+			ns, err := D.NewRR("example.com. 60 IN NS ns.example.com.")
+			require.NoError(t, err)
+			cached.Ns = []D.RR{ns}
+			cached.SetEdns0(1232, true)
+			cached.IsEdns0().Option = []D.EDNS0{&D.EDNS0_LOCAL{Code: domainBundleOption, Data: []byte{1}}}
+			original := cached.Copy()
+			client.cache.SetWithExpire(domainKey("projection", "example.com"), cached, time.Now().Add(40*time.Second))
+			client.bundles.MarkUnsupported("projection")
+			request := new(D.Msg)
+			request.SetQuestion("example.com.", qtype)
+			response, err := client.ExchangeContext(t.Context(), request)
+			require.NoError(t, err)
+			require.Len(t, response.Answer, 1)
+			require.True(t, response.RecursionAvailable)
+			require.Equal(t, request.Id, response.Id)
+			require.Equal(t, request.Question, response.Question)
+			require.Positive(t, response.Answer[0].Header().Ttl)
+			require.LessOrEqual(t, response.Answer[0].Header().Ttl, uint32(40))
+			if qtype == D.TypeHTTPS {
+				require.Len(t, response.Ns, 1)
+				require.Empty(t, response.Extra)
+				values := serviceRecordValues(response.Answer[0])
+				values[D.SVCB_ECHCONFIG].(*D.SVCBECHConfig).ECH[0]++
+				values[D.SVCB_IPV4HINT].(*D.SVCBIPv4Hint).Hint[0][0]++
+			} else {
+				require.Empty(t, response.Ns)
+				require.Len(t, response.Extra, len(cached.Extra))
+				require.True(t, response.IsEdns0().Do(), "OPT flags must not become a TTL")
+				response.IsEdns0().Option[0].(*D.EDNS0_LOCAL).Data[0]++
+				switch rr := response.Answer[0].(type) {
+				case *D.A:
+					rr.A[0]++
+				case *D.AAAA:
+					rr.AAAA[0]++
+				}
+			}
+			setMsgTTL(response, 1)
+			require.Equal(t, original, cached, "caller mutations must leave the complete cached bundle intact")
+		})
+	}
+}
+
 func TestFakeIPFirstAddressWarmsServiceBundle(t *testing.T) {
 	client, calls, _ := testBundleClient(t)
 	pool := newTestFakeIPPool(t, "198.18.0.0/16")

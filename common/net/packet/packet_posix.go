@@ -22,15 +22,12 @@ func (c *enhanceUDPConn) WaitReadFrom() (data []byte, put func(), addr net.Addr,
 	var readErr error
 	err = c.rawConn.Read(func(fd uintptr) (done bool) {
 		readBuf := pool.Get(pool.UDPBufferSize)
-		put = func() {
-			_ = pool.Put(readBuf)
-		}
 		var readFrom syscall.Sockaddr
 		var readN int
 		var flags int
 		readN, _, flags, readFrom, readErr = syscall.Recvmsg(int(fd), readBuf, nil, 0)
 		if flags&syscall.MSG_TRUNC != 0 {
-			put()
+			_ = pool.Put(readBuf)
 			put = nil
 			data = nil
 			readErr = syscall.EMSGSIZE
@@ -38,8 +35,9 @@ func (c *enhanceUDPConn) WaitReadFrom() (data []byte, put func(), addr net.Addr,
 		}
 		if readN > 0 {
 			data = readBuf[:readN]
+			put = func() { _ = pool.Put(readBuf) }
 		} else {
-			put()
+			_ = pool.Put(readBuf)
 			put = nil
 			data = nil
 		}

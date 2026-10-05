@@ -93,13 +93,16 @@ func (c *domainClient) exchangePrepared(ctx context.Context, request *D.Msg, nod
 		return c.publicExchange(ctx, request)
 	}
 	key := domainKey(node, host)
-	_, _, hasCachedBundle := c.cache.GetWithExpire(key)
-	_, _, hasCachedRecord := c.records.GetWithExpire(key + keySep + q.String())
-	if !hasCachedBundle && !hasCachedRecord && !tunneldns.Supported(node) {
-		if addressQuery {
-			return nil, errors.New("server DNS capability is in retry backoff")
+	scope, _, _ := strings.Cut(key, keySep)
+	cachedBundle, bundleExpiry, hasCachedBundle := c.cache.GetWithExpire(key)
+	if !hasCachedBundle && !tunneldns.Supported(node) {
+		_, _, hasCachedRecord := c.records.GetWithExpire(key + keySep + q.String())
+		if !hasCachedRecord {
+			if addressQuery {
+				return nil, errors.New("server DNS capability is in retry backoff")
+			}
+			return c.publicExchange(ctx, request)
 		}
-		return c.publicExchange(ctx, request)
 	}
 	if !hasCachedBundle && !c.bundles.Supported(node) {
 		if addressQuery {
@@ -111,30 +114,30 @@ func (c *domainClient) exchangePrepared(ctx context.Context, request *D.Msg, nod
 		return c.cachedExchange(ctx, key, node, host, dial, request)
 	}
 	project := func(msg *D.Msg, expiry time.Time) *D.Msg {
-		msg = msg.Copy()
-		if !expiry.IsZero() {
-			if time.Now().Before(expiry) {
-				setMsgTTL(msg, uint32(max(1, time.Until(expiry)/time.Second)))
-			} else {
-				setMsgTTL(msg, 3)
-			}
-		}
 		response := new(D.Msg)
 		response.SetReply(request)
 		response.RecursionAvailable = true
 		response.Rcode = msg.Rcode
 		if q.Qtype == D.TypeHTTPS {
-			response.Answer = msg.Answer
-			response.Ns = msg.Ns
+			response.Answer = copyDomainRecords(msg.Answer)
+			response.Ns = copyDomainRecords(msg.Ns)
 		} else {
 			// Keep the complete bundle internally, including its TTL when the
 			// requested family is empty. withFakeIP never exposes these addresses.
-			response.Extra = msg.Extra
-			for _, rr := range msg.Extra {
-				if rr.Header().Rrtype == q.Qtype && strings.EqualFold(rr.Header().Name, D.Fqdn(host)) {
+			response.Extra = copyDomainRecords(msg.Extra)
+			name := D.Fqdn(host)
+			for _, rr := range response.Extra {
+				if rr.Header().Rrtype == q.Qtype && strings.EqualFold(rr.Header().Name, name) {
 					response.Answer = append(response.Answer, rr)
 				}
 			}
+		}
+		if !expiry.IsZero() {
+			ttl := uint32(3)
+			if remaining := time.Until(expiry); remaining > 0 {
+				ttl = uint32(max(1, remaining/time.Second))
+			}
+			setMsgTTL(response, ttl)
 		}
 		return response
 	}
@@ -181,16 +184,16 @@ func (c *domainClient) exchangePrepared(ctx context.Context, request *D.Msg, nod
 			return msg.Copy(), time.Now().Add(time.Duration(ttl) * time.Second), nil
 		})
 	}
-	if msg, expiry, ok := c.cache.GetWithExpire(key); ok {
-		if !time.Now().Before(expiry) {
-			logDNSCache(q, "stale", strings.SplitN(key, keySep, 2)[0])
+	if hasCachedBundle {
+		if !time.Now().Before(bundleExpiry) {
+			logDNSCache(q, "stale", scope)
 			refresh()
 		} else {
-			logDNSCache(q, "fresh", strings.SplitN(key, keySep, 2)[0])
+			logDNSCache(q, "fresh", scope)
 		}
-		return project(msg, expiry), nil
+		return project(cachedBundle, bundleExpiry), nil
 	}
-	logDNSCache(q, "miss", strings.SplitN(key, keySep, 2)[0])
+	logDNSCache(q, "miss", scope)
 	msg, refreshErr := refresh()(ctx)
 	if refreshErr != nil {
 		if addressQuery {
@@ -201,6 +204,18 @@ func (c *domainClient) exchangePrepared(ctx context.Context, request *D.Msg, nod
 		return c.cachedExchange(ctx, key, node, host, dial, request)
 	}
 	return project(msg, time.Time{}), nil
+}
+
+// A reply owns every record it exposes, but need not copy unused bundle sections.
+func copyDomainRecords(records []D.RR) []D.RR {
+	if records == nil {
+		return nil
+	}
+	result := make([]D.RR, len(records))
+	for i, rr := range records {
+		result[i] = D.Copy(rr)
+	}
+	return result
 }
 
 func (c *domainClient) cachedExchange(ctx context.Context, key, node, host string, dial func(context.Context) (net.Conn, error), request *D.Msg) (*D.Msg, error) {
