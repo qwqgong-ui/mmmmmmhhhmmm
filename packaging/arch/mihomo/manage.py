@@ -39,9 +39,7 @@ def parameters(settings):
     opts = tomllib.loads(Path(settings).read_text())
     core = yaml.safe_load(Path(opts['core_config']).read_text())
     tun = core.get('tun', {})
-    if not all(tun.get(k) is True for k in ('enable', 'auto-route', 'auto-detect-interface')):
-        raise ValueError('TUN fallback requires enable, auto-route and auto-detect-interface')
-    if tun.get('auto-redirect', False):
+    if tun.get('enable', False) and tun.get('auto-redirect', False):
         raise ValueError('Disable tun.auto-redirect before registering TPROXY')
     p = {k: opts[k] for k in ('proxy_mark', 'route_table', 'bypass_priority', 'proxy_priority')}
     p.update(port=core.get('tproxy-port', 0), bypass_mark=core.get('routing-mark', 0))
@@ -59,7 +57,6 @@ def parameters(settings):
     p['fake6'] = str(ipaddress.IPv6Network(dns.get('fake-ip-range6', '2001:2::/48'), strict=False))
     p['direct4'] = cidrs(opts['direct4'], 4)
     p['direct6'] = cidrs(opts['direct6'], 6)
-    p['resolved'] = Path('/sys/fs/cgroup/system.slice/systemd-resolved.service').is_dir()
     return p
 
 
@@ -70,8 +67,6 @@ def nft_set(name, version, networks):
 
 def render(p):
     bypass, proxy = p['bypass_mark'], p['proxy_mark']
-    resolved = (f'socket cgroupv2 level 2 "system.slice/systemd-resolved.service" '
-                f'counter meta mark set {bypass} return' if p['resolved'] else '')
     private4 = ['0.0.0.0/8', '10.0.0.0/8', '127.0.0.0/8', '169.254.0.0/16',
                 '172.16.0.0/12', '192.168.0.0/16', '224.0.0.0/4', '240.0.0.0/4']
     private6 = ['::/128', '::1/128', 'fc00::/7', 'fe80::/10', 'ff00::/8']
@@ -82,7 +77,6 @@ chain output {{
     type route hook output priority mangle; policy accept;
     meta mark {bypass} counter return
     socket cgroupv2 level 2 "system.slice/mihomo.service" counter meta mark set {bypass} return
-    {resolved}
     meta l4proto != {{ tcp, udp }} return
     th dport 53 counter meta mark set {proxy} return
     ip daddr {p['fake4']} counter meta mark set {proxy} return

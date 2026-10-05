@@ -1,6 +1,6 @@
 pkgbase = mihomo
 	pkgdesc = Mihomo dev core with local TCP/UDP TPROXY and explicit kernel direct bypass
-	pkgver = dev.r265ffd32
+	pkgver = dev.r4447.g3aabbe2c
 	pkgrel = 2
 	epoch = 9999
 	url = https://github.com/qwqgong-ui/mmmmmmhhhmmm
@@ -10,13 +10,12 @@ pkgbase = mihomo
 	makedepends = go
 	makedepends = git
 	makedepends = make
-	depends = glibc
 	depends = nftables
 	depends = iproute2
 	depends = python
 	depends = python-yaml
 	depends = systemd
-	provides = mihomo-bin=9999:dev.r265ffd32
+	provides = mihomo-bin=9999:dev.r4447.g3aabbe2c
 	provides = clash-meta
 	conflicts = mihomo-bin
 	conflicts = mihomo-tproxy
