@@ -1,6 +1,6 @@
 pkgname=mihomo
-pkgver=dev.r4449.g952d2850
-pkgrel=3
+pkgver=dev.r4450.ge307d4f9
+pkgrel=1
 epoch=9999
 pkgdesc='Mihomo dev core with local TCP/UDP TPROXY and explicit kernel direct bypass'
 arch=('x86_64')

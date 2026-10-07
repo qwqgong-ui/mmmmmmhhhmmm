@@ -30,6 +30,9 @@ Mihomo 自身的上游连接排除，避免 DNS 回环；systemd-resolved 的 TC
 `mihomo-tproxy-watch.service` 随主服务运行，监听接口/地址变化并更新自己拥有的
 路由；注册或更新后清理 resolved 缓存，避免继续使用接管前的错误结果。
 这不修改 NetworkManager、resolved、NSS 或现有 Mihomo DNS 上游配置。
+纯 TPROXY 的 `system` DNS 在没有 TUN 接口发现器时，通过带上游绕过标记的
+Linux 路由查询自动选择出口，读取该接口的 DHCP/DNS 信息；不要求固定
+`interface-name`，也不使用指回本机的 DNS stub 作为上游。
 包只接管本机流量，不接管其他设备的转发流量。
 
 ## 确定直连绕过

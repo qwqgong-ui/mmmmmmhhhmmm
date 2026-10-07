@@ -5,7 +5,6 @@ package dns
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -23,7 +22,11 @@ const systemDHCPTimeout = 10 * time.Second
 func dnsReadConfig() ([]systemNameServer, error) {
 	interfaceName := defaultPhysicalInterface()
 	if interfaceName == "" {
-		return nil, errors.New("default physical interface is unavailable")
+		var err error
+		interfaceName, err = linuxDefaultPhysicalInterface()
+		if err != nil {
+			return nil, fmt.Errorf("default physical interface is unavailable: %w", err)
+		}
 	}
 	iface, err := net.InterfaceByName(interfaceName)
 	if err != nil {
