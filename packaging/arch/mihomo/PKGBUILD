@@ -1,6 +1,6 @@
 pkgname=mihomo
-pkgver=dev.r4447.g3aabbe2c
-pkgrel=2
+pkgver=dev.r4449.g952d2850
+pkgrel=3
 epoch=9999
 pkgdesc='Mihomo dev core with local TCP/UDP TPROXY and explicit kernel direct bypass'
 arch=('x86_64')
@@ -12,8 +12,8 @@ provides=("mihomo-bin=$epoch:$pkgver" 'clash-meta')
 conflicts=('mihomo-bin' 'mihomo-tproxy')
 options=('!strip' '!debug')
 install=mihomo.install
-source=('manage.py' 'tproxy.toml' 'direct4.cidr' 'direct6.cidr' '50-tproxy.conf' 'config.yaml')
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
+source=('manage.py' 'tproxy.toml' 'direct4.cidr' 'direct6.cidr' '50-tproxy.conf' 'config.yaml' 'mihomo-tproxy-watch.service')
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP')
 backup=('etc/mihomo/config.yaml' 'etc/mihomo/tproxy.toml' 'etc/mihomo/direct4.cidr' 'etc/mihomo/direct6.cidr')
 
 pkgver() {
@@ -36,6 +36,7 @@ package() {
     install -Dm644 "$startdir/../../../.github/release/mihomo.service" "$pkgdir/usr/lib/systemd/system/mihomo.service"
     install -Dm755 "$srcdir/manage.py" "$pkgdir/usr/lib/mihomo-tproxy/manage"
     install -Dm644 "$srcdir/50-tproxy.conf" "$pkgdir/usr/lib/systemd/system/mihomo.service.d/50-tproxy.conf"
+    install -Dm644 "$srcdir/mihomo-tproxy-watch.service" "$pkgdir/usr/lib/systemd/system/mihomo-tproxy-watch.service"
     for config in tproxy.toml direct4.cidr direct6.cidr; do
         install -Dm644 "$srcdir/$config" "$pkgdir/etc/mihomo/$config"
     done

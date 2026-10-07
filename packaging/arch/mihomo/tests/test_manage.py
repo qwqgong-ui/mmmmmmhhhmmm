@@ -2,6 +2,9 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
+import json
+import subprocess
 
 spec = importlib.util.spec_from_file_location('manage', Path(__file__).parents[1] / 'manage.py')
 manage = importlib.util.module_from_spec(spec)
@@ -84,6 +87,99 @@ class DirectBypassTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'priority already occupied'):
                 manage.start(p)
         self.assertFalse(any('add' in c or 'delete' in c for c in calls))
+
+
+class InterfaceRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        state = Path(self.directory.name) / 'state.json'
+        self.state_patch = patch.object(manage, 'STATE', state)
+        self.state_patch.start()
+        self.addCleanup(self.state_patch.stop)
+        self.p = dict(route_table=166, proxy_priority=100, proxy_mark=358,
+                      bypass_priority=50, bypass_mark=666)
+        self.routes = {('-4', 200, 77): 'unrelated'}
+        self.fail_ipv6 = False
+
+    def fake_run(self, *args, **kwargs):
+        if args[:3] == ('ip', '-j', 'address'):
+            return subprocess.CompletedProcess(args, 0, json.dumps(self.links), '')
+        if args[0] == 'ip' and args[2] == 'route' and 'metric' in args:
+            key = (args[1], int(args[args.index('table') + 1]), int(args[args.index('metric') + 1]))
+            if args[3] == 'replace':
+                if args[1] == '-6' and self.fail_ipv6:
+                    raise subprocess.CalledProcessError(1, args, stderr='temporary link failure')
+                self.routes[key] = args[args.index('dev') + 1]
+            elif args[3] == 'del':
+                self.routes.pop(key, None)
+        return subprocess.CompletedProcess(args, 0, '', '')
+
+    def link(self, name, index, families=('inet', 'inet6')):
+        return dict(ifname=name, ifindex=index, flags=['UP'],
+                    addr_info=[dict(family=family) for family in families])
+
+    def test_refresh_handles_link_changes_and_renames(self):
+        self.links = [self.link('wlan0', 3), self.link('lo', 1), self.link('eth0', 4, ())]
+        self.links[1]['flags'].append('LOOPBACK')
+        with patch.object(manage, 'run', side_effect=self.fake_run):
+            self.assertTrue(manage.refresh_interface_routes(self.p))
+            self.assertEqual(self.routes[('-4', 166, 10003)], 'wlan0')
+            self.assertEqual(self.routes[('-6', 166, 10003)], 'wlan0')
+            self.assertEqual(len(self.routes), 3)
+            self.assertFalse(manage.refresh_interface_routes(self.p))
+            self.links = [self.link('wifi0', 3)]
+            self.assertTrue(manage.refresh_interface_routes(self.p))
+            self.assertEqual(self.routes[('-6', 166, 10003)], 'wifi0')
+            self.links = [self.link('eth0', 4, ('inet',))]
+            self.assertTrue(manage.refresh_interface_routes(self.p))
+            self.assertEqual(self.routes, {('-4', 200, 77): 'unrelated', ('-4', 166, 10004): 'eth0'})
+            manage.stop()
+            self.assertEqual(self.routes, {('-4', 200, 77): 'unrelated'})
+            self.assertFalse(manage.STATE.exists())
+
+    def test_failed_refresh_remains_owned_and_is_retried(self):
+        self.links = [self.link('wlan0', 3)]
+        self.fail_ipv6 = True
+        with patch.object(manage, 'run', side_effect=self.fake_run):
+            with self.assertRaises(subprocess.CalledProcessError):
+                manage.refresh_interface_routes(self.p)
+            pending = json.loads(manage.STATE.read_text())
+            self.assertTrue(pending['interfaces_pending'])
+            self.assertEqual(len(pending['interface_routes']), 2)
+            self.fail_ipv6 = False
+            self.assertTrue(manage.refresh_interface_routes(pending))
+            self.assertNotIn('interfaces_pending', json.loads(manage.STATE.read_text()))
+            self.assertEqual(self.routes[('-6', 166, 10003)], 'wlan0')
+            manage.stop()
+            self.assertEqual(self.routes, {('-4', 200, 77): 'unrelated'})
+
+    def test_orphan_addresses_during_hotplug_are_ignored(self):
+        self.links = [self.link('wlan0', 3), {'addr_info': [{'family': 'inet6'}]},
+                      {'ifindex': 4, 'addr_info': [{'family': 'inet'}]},
+                      {'ifindex': 4, 'ifname': 'deleted', 'addr_info': [{'family': 'inet6'}]}]
+        with patch.object(manage, 'run', side_effect=self.fake_run):
+            manage.refresh_interface_routes(self.p)
+            self.assertEqual(self.routes, {('-4', 200, 77): 'unrelated',
+                                           ('-4', 166, 10003): 'wlan0', ('-6', 166, 10003): 'wlan0'})
+
+    def test_stop_cleans_a_partial_refresh(self):
+        self.links = [self.link('wlan0', 3)]
+        self.fail_ipv6 = True
+        with patch.object(manage, 'run', side_effect=self.fake_run):
+            with self.assertRaises(subprocess.CalledProcessError):
+                manage.refresh_interface_routes(self.p)
+            manage.stop()
+            self.assertEqual(self.routes, {('-4', 200, 77): 'unrelated'})
+
+    def test_failed_state_replacement_preserves_cleanup_record(self):
+        manage.save_state(self.p)
+        previous = manage.STATE.read_bytes()
+        with patch.object(manage.Path, 'replace', side_effect=OSError('state replacement failed')):
+            with self.assertRaises(OSError):
+                manage.save_state(dict(self.p, interfaces_pending=True))
+        self.assertEqual(manage.STATE.read_bytes(), previous)
+        self.assertEqual(manage.STATE.stat().st_mode & 0o777, 0o600)
 
 
 if __name__ == '__main__':

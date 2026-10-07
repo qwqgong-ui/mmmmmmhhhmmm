@@ -24,6 +24,12 @@ routing-mark: 666
 Mihomo 配置决定，例如 `DST-PORT,53,dns` 和 `type: dns` 出站。
 Mihomo 自身的上游连接排除，避免 DNS 回环；systemd-resolved 的 TCP/UDP 53
 查询照常接管，使用 NSS `resolve` 的程序也能收到 Fake-IP。
+策略表同时注册 `lo` 和已配置地址的出口接口的本地路由，避免 resolved 的
+`IP_UNICAST_IF`/`IPV6_UNICAST_IF` 接口约束绕过接管。IPv6 link-local DNS 的
+原始作用域和回包接口保留，不把接口名当成无作用域地址。
+`mihomo-tproxy-watch.service` 随主服务运行，监听接口/地址变化并更新自己拥有的
+路由；注册或更新后清理 resolved 缓存，避免继续使用接管前的错误结果。
+这不修改 NetworkManager、resolved、NSS 或现有 Mihomo DNS 上游配置。
 包只接管本机流量，不接管其他设备的转发流量。
 
 ## 确定直连绕过
@@ -62,6 +68,7 @@ sudo pacman -U "$(makepkg --packagelist)"
 
 ```bash
 sudo /usr/lib/mihomo-tproxy/manage validate
+systemctl status mihomo-tproxy-watch.service
 sudo nft list table inet mihomo_tproxy
 ip rule
 ip -6 rule
@@ -70,4 +77,4 @@ sudo /usr/lib/mihomo-tproxy/manage stop
 
 `stop` 撤下 TPROXY 接管；恢复时调用 `manage start` 或重启服务。
 它只删除 `/run/mihomo-tproxy/state.json` 记录的规则
-和自己的 nft 表，不 flush 全局防火墙、其他路由表或 conntrack。
+及接口路由和自己的 nft 表，不 flush 全局防火墙、其他路由表或 conntrack。

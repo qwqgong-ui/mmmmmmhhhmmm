@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh Mihomo TPROXY routes on interface changes
+BindsTo=mihomo.service
+PartOf=mihomo.service
+After=mihomo.service
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/mihomo-tproxy/manage watch
+Restart=on-failure
+RestartSec=1

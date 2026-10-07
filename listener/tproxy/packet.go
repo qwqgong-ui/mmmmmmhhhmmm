@@ -15,6 +15,7 @@ import (
 type packet struct {
 	pc        net.PacketConn
 	lAddr     netip.AddrPort
+	rAddr     netip.AddrPort
 	buf       []byte
 	tunnel    C.Tunnel
 	additions []inbound.Addition
@@ -26,13 +27,26 @@ func (c *packet) Data() []byte {
 
 // WriteBack opens a new socket binding `addr` to write UDP packet back
 func (c *packet) WriteBack(b []byte, addr net.Addr) (n int, err error) {
-	rAddr := addr.(*net.UDPAddr).AddrPort() // tunnel's handleUDPToLocal will ensure addr is *net.UDPAddr
+	rAddr := c.scopedReplyAddr(addr.(*net.UDPAddr).AddrPort()) // tunnel's handleUDPToLocal will ensure addr is *net.UDPAddr
 	tc, err := createOrGetLocalConn(rAddr, c.lAddr, c.tunnel, c.additions...)
 	if err != nil {
 		return
 	}
 	n, err = tc.Write(b)
 	return
+}
+
+func (c *packet) scopedReplyAddr(addr netip.AddrPort) netip.AddrPort {
+	ip := addr.Addr()
+	if ip.IsLinkLocalUnicast() && ip.Is6() && ip.Zone() == "" {
+		// SOCKS address encoding in the tunnel cannot carry an IPv6 scope.
+		zone := c.rAddr.Addr().Zone()
+		if zone == "" {
+			zone = c.lAddr.Addr().Zone()
+		}
+		addr = netip.AddrPortFrom(ip.WithZone(zone), addr.Port())
+	}
+	return addr
 }
 
 // LocalAddr returns the source IP/Port of UDP Packet

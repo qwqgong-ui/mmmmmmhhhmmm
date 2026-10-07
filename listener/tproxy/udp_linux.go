@@ -53,6 +53,11 @@ func dialUDP(network string, lAddr, rAddr netip.AddrPort) (uc *net.UDPConn, err 
 	if err = syscall.SetsockoptInt(fd, syscall.SOL_IP, syscall.IP_TRANSPARENT, 1); err != nil {
 		return nil, err
 	}
+	if udpAddrFamily(network, lAddr, rAddr) == syscall.AF_INET6 {
+		if err = syscall.SetsockoptInt(fd, syscall.SOL_IPV6, IPV6_TRANSPARENT, 1); err != nil {
+			return nil, err
+		}
+	}
 
 	if err = syscall.Bind(fd, lSockAddr); err != nil {
 		return nil, err
@@ -78,9 +83,17 @@ func udpAddrToSockAddr(addr netip.AddrPort) (syscall.Sockaddr, error) {
 		return &syscall.SockaddrInet4{Addr: addr.Addr().As4(), Port: int(addr.Port())}, nil
 	}
 
-	zoneID, err := strconv.ParseUint(addr.Addr().Zone(), 10, 32)
-	if err != nil {
-		zoneID = 0
+	var zoneID uint64
+	if zone := addr.Addr().Zone(); zone != "" {
+		var err error
+		zoneID, err = strconv.ParseUint(zone, 10, 32)
+		if err != nil {
+			iface, err := net.InterfaceByName(zone)
+			if err != nil {
+				return nil, fmt.Errorf("resolve IPv6 zone %q: %w", zone, err)
+			}
+			zoneID = uint64(iface.Index)
+		}
 	}
 
 	return &syscall.SockaddrInet6{Addr: addr.Addr().As16(), Port: int(addr.Port()), ZoneId: uint32(zoneID)}, nil
@@ -126,7 +139,11 @@ func getOrigDst(oob []byte) (netip.AddrPort, error) {
 	case *unix.SockaddrInet4:
 		rAddr = netip.AddrPortFrom(netip.AddrFrom4(v.Addr), uint16(v.Port))
 	case *unix.SockaddrInet6:
-		rAddr = netip.AddrPortFrom(netip.AddrFrom16(v.Addr), uint16(v.Port))
+		addr := netip.AddrFrom16(v.Addr)
+		if v.ZoneId != 0 {
+			addr = addr.WithZone(strconv.FormatUint(uint64(v.ZoneId), 10))
+		}
+		rAddr = netip.AddrPortFrom(addr, uint16(v.Port))
 	default:
 		return netip.AddrPort{}, fmt.Errorf("unsupported address type: %T", v)
 	}

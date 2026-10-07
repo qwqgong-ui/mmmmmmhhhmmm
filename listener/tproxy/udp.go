@@ -105,6 +105,7 @@ func handlePacketConn(pc net.PacketConn, tunnel C.Tunnel, buf []byte, lAddr, rAd
 	pkt := &packet{
 		pc:        pc,
 		lAddr:     lAddr,
+		rAddr:     rAddr,
 		buf:       buf,
 		tunnel:    tunnel,
 		additions: additions,
