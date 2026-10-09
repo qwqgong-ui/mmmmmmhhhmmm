@@ -230,6 +230,7 @@ func New(config LC.Hysteria2Server, lc C.InboundListenConfig, tunnel C.Tunnel, a
 		RealmOptions:          realmOptions,
 		SetBBRCongestion: func(quicConn *quic.Conn) {
 			common.SetCongestionController(quicConn, "bbr", config.CWND, config.BBRProfile)
+			quicConn.EnableKernelPacing()
 		},
 	})
 	if err != nil {

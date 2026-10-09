@@ -236,6 +236,7 @@ func NewHysteria2(option Hysteria2Option) (*Hysteria2, error) {
 		}),
 		SetBBRCongestion: func(quicConn *quic.Conn) {
 			common.SetCongestionController(quicConn, "bbr", option.CWND, option.BBRProfile)
+			quicConn.EnableKernelPacing()
 		},
 		HandshakeTimeout: time.Duration(option.HandshakeTimeout) * time.Second,
 	}
