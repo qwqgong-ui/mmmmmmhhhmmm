@@ -1,0 +1,334 @@
+{
+  "date": "2026-10-10",
+  "method": "Same HY2 server UDP443 and client configuration; test service cgroup only uses temporary fixed-source-port SNAT, keeping native physical fq path; three repetitions per client binary.",
+  "before_sha256": "db31ab5d1cefbcd975c1a32e8ef588f244be60101c8f7af355129cf497de28b8",
+  "after_sha256": "9706c1302663075260ff2c686562feb6947b0030fd62a46019d64d76fd99d468",
+  "GOAMD64": "v3",
+  "GOEXPERIMENT": "simd",
+  "profile": "aggressive",
+  "server_sha256": "7546db3d4cc023ab507f457f2987810742900f06fdd93444c7d3dbb352dd6396",
+  "validation": {
+    "same_remote_tuple_requests": 112,
+    "client_fq_route_ready": true,
+    "related_race_passed": true,
+    "fq_namespace_test_passed": true,
+    "non_fq_fallback_passed": true,
+    "full_ackhandler_passed": true,
+    "windows_amd64_v3_and_android_arm64_package_builds_passed": true,
+    "live_http_status": 204,
+    "live_hy2_delay_ms": [
+      86,
+      87,
+      86
+    ]
+  },
+  "existing_failures_reproduced_before_change": [
+    "TestDial",
+    "TestTransportAndDialConcurrentClose"
+  ],
+  "subsequent_test_fixture_repair": {
+    "patch": "0009-tests-use-explicit-tls-server-name.patch",
+    "cause": "Tests used empty TLS configuration while this fork disables automatic ServerName inference.",
+    "change": "Set ServerName to localhost in the four Dial fixtures and the concurrent-close client fixture; preserve certificate verification and assertions.",
+    "full_quic_ackhandler_and_bbr_suites_passed_without_exclusions": true,
+    "full_related_race_suites_passed": true
+  },
+  "limitations": [
+    "Short production WAN samples do not prove long-term fairness or CPU benefit.",
+    "The cpu_percent samples are from xray.service, not the client.",
+    "Host fq flow_limit was observed as 100 before testing and 256 later, outside this task; no host qdisc changes were made by the alignment workflow.",
+    "WAN CE response was not induced or measured by this comparison."
+  ],
+  "summary": {
+    "download": {
+      "before": {
+        "mbps": 477.69471377097176,
+        "cpu_percent": 71.87286487161461,
+        "ttfb_ms_median": 81.498
+      },
+      "after": {
+        "mbps": 479.40744264847683,
+        "cpu_percent": 68.8291008647354,
+        "ttfb_ms_median": 81.05199999999999
+      }
+    },
+    "upload": {
+      "before": {
+        "mbps": 227.67697292833262,
+        "cpu_percent": 46.82028390314362,
+        "ttfb_ms_median": 286.771
+      },
+      "after": {
+        "mbps": 260.50754351633617,
+        "cpu_percent": 42.98544276317651,
+        "ttfb_ms_median": 249.312
+      }
+    },
+    "parallel_download": {
+      "before": {
+        "mbps": 582.8447753465874,
+        "cpu_percent": 78.5615814031171,
+        "ttfb_ms_median": 82.1865
+      },
+      "after": {
+        "mbps": 577.9176718459511,
+        "cpu_percent": 77.93882634154849,
+        "ttfb_ms_median": 83.6925
+      }
+    },
+    "latency": {
+      "before": {
+        "mbps": 0.09637103327769311,
+        "cpu_percent": 2.5790505103911716,
+        "ttfb_ms_median": 80.935
+      },
+      "after": {
+        "mbps": 0.09624488345172542,
+        "cpu_percent": 2.475790630176127,
+        "ttfb_ms_median": 80.928
+      }
+    }
+  },
+  "records": [
+    {
+      "variant": "before",
+      "repeat": 1,
+      "workload": "download",
+      "bytes": 16777216,
+      "seconds": 0.4257889649888966,
+      "mbps": 315.2212458195106,
+      "ttfb_ms_median": 81.271,
+      "cpu_percent": 80.34426162475134
+    },
+    {
+      "variant": "before",
+      "repeat": 1,
+      "workload": "upload",
+      "bytes": 8388608,
+      "seconds": 0.7255553830036661,
+      "mbps": 92.49309642246968,
+      "ttfb_ms_median": 717.412,
+      "cpu_percent": 25.892027597161494
+    },
+    {
+      "variant": "before",
+      "repeat": 1,
+      "workload": "parallel_download",
+      "bytes": 16777216,
+      "seconds": 0.23028039999189787,
+      "mbps": 582.8447753465874,
+      "ttfb_ms_median": 82.1865,
+      "cpu_percent": 82.44383803688012
+    },
+    {
+      "variant": "before",
+      "repeat": 1,
+      "workload": "latency",
+      "bytes": 12288,
+      "seconds": 1.020057549001649,
+      "mbps": 0.09637103327769311,
+      "ttfb_ms_median": 80.935,
+      "cpu_percent": 3.0388481542378045
+    },
+    {
+      "variant": "before",
+      "repeat": 2,
+      "workload": "download",
+      "bytes": 16777216,
+      "seconds": 0.27787121100118384,
+      "mbps": 483.0213519292151,
+      "ttfb_ms_median": 82.138,
+      "cpu_percent": 71.87286487161461
+    },
+    {
+      "variant": "before",
+      "repeat": 2,
+      "workload": "upload",
+      "bytes": 8388608,
+      "seconds": 0.29475472700141836,
+      "mbps": 227.67697292833262,
+      "ttfb_ms_median": 286.771,
+      "cpu_percent": 46.82028390314362
+    },
+    {
+      "variant": "before",
+      "repeat": 2,
+      "workload": "parallel_download",
+      "bytes": 16777216,
+      "seconds": 0.2303352309972979,
+      "mbps": 582.7060298976778,
+      "ttfb_ms_median": 82.928,
+      "cpu_percent": 78.5615814031171
+    },
+    {
+      "variant": "before",
+      "repeat": 2,
+      "workload": "latency",
+      "bytes": 12288,
+      "seconds": 1.0182817239983706,
+      "mbps": 0.0965390988399565,
+      "ttfb_ms_median": 80.9205,
+      "cpu_percent": 2.5790505103911716
+    },
+    {
+      "variant": "before",
+      "repeat": 3,
+      "workload": "download",
+      "bytes": 16777216,
+      "seconds": 0.28096967400051653,
+      "mbps": 477.69471377097176,
+      "ttfb_ms_median": 81.498,
+      "cpu_percent": 69.40108418947787
+    },
+    {
+      "variant": "before",
+      "repeat": 3,
+      "workload": "upload",
+      "bytes": 8388608,
+      "seconds": 0.2253677720000269,
+      "mbps": 297.77489214381546,
+      "ttfb_ms_median": 215.857,
+      "cpu_percent": 51.81530569507785
+    },
+    {
+      "variant": "before",
+      "repeat": 3,
+      "workload": "parallel_download",
+      "bytes": 16777216,
+      "seconds": 0.22955632299999706,
+      "mbps": 584.6832108388568,
+      "ttfb_ms_median": 82.0405,
+      "cpu_percent": 77.1893353597593
+    },
+    {
+      "variant": "before",
+      "repeat": 3,
+      "workload": "latency",
+      "bytes": 12288,
+      "seconds": 1.0234082450042479,
+      "mbps": 0.09605550910877406,
+      "ttfb_ms_median": 80.9365,
+      "cpu_percent": 2.3336728149870307
+    },
+    {
+      "variant": "after",
+      "repeat": 1,
+      "workload": "download",
+      "bytes": 16777216,
+      "seconds": 0.40203543700044975,
+      "mbps": 333.8455162096815,
+      "ttfb_ms_median": 81.05199999999999,
+      "cpu_percent": 82.17658683645601
+    },
+    {
+      "variant": "after",
+      "repeat": 1,
+      "workload": "upload",
+      "bytes": 8388608,
+      "seconds": 0.8745374650025042,
+      "mbps": 76.73640831363107,
+      "ttfb_ms_median": 865.983,
+      "cpu_percent": 19.26081005569243
+    },
+    {
+      "variant": "after",
+      "repeat": 1,
+      "workload": "parallel_download",
+      "bytes": 16777216,
+      "seconds": 0.23224368199589662,
+      "mbps": 577.9176718459511,
+      "ttfb_ms_median": 83.19800000000001,
+      "cpu_percent": 77.93882634154849
+    },
+    {
+      "variant": "after",
+      "repeat": 1,
+      "workload": "latency",
+      "bytes": 12288,
+      "seconds": 1.0238697299937485,
+      "mbps": 0.0960122143669588,
+      "ttfb_ms_median": 81.10900000000001,
+      "cpu_percent": 2.421792467695221
+    },
+    {
+      "variant": "after",
+      "repeat": 2,
+      "workload": "download",
+      "bytes": 16777216,
+      "seconds": 0.2793434019986307,
+      "mbps": 480.4757407538765,
+      "ttfb_ms_median": 81.342,
+      "cpu_percent": 68.29049787291382
+    },
+    {
+      "variant": "after",
+      "repeat": 2,
+      "workload": "upload",
+      "bytes": 8388608,
+      "seconds": 0.2342338309972547,
+      "mbps": 286.50372029643546,
+      "ttfb_ms_median": 226.183,
+      "cpu_percent": 53.57210760962652
+    },
+    {
+      "variant": "after",
+      "repeat": 2,
+      "workload": "parallel_download",
+      "bytes": 16777216,
+      "seconds": 0.23319052200531587,
+      "mbps": 575.5711117493032,
+      "ttfb_ms_median": 83.6925,
+      "cpu_percent": 76.9675364403998
+    },
+    {
+      "variant": "after",
+      "repeat": 2,
+      "workload": "latency",
+      "bytes": 12288,
+      "seconds": 1.0213945559953572,
+      "mbps": 0.09624488345172542,
+      "ttfb_ms_median": 80.5145,
+      "cpu_percent": 2.5951773332264056
+    },
+    {
+      "variant": "after",
+      "repeat": 3,
+      "workload": "download",
+      "bytes": 16777216,
+      "seconds": 0.2799658830044791,
+      "mbps": 479.40744264847683,
+      "ttfb_ms_median": 80.345,
+      "cpu_percent": 68.8291008647354
+    },
+    {
+      "variant": "after",
+      "repeat": 3,
+      "workload": "upload",
+      "bytes": 8388608,
+      "seconds": 0.2576081409933977,
+      "mbps": 260.50754351633617,
+      "ttfb_ms_median": 249.312,
+      "cpu_percent": 42.98544276317651
+    },
+    {
+      "variant": "after",
+      "repeat": 3,
+      "workload": "parallel_download",
+      "bytes": 16777216,
+      "seconds": 0.23098763800226152,
+      "mbps": 581.0602210612064,
+      "ttfb_ms_median": 86.244,
+      "cpu_percent": 88.0237582229441
+    },
+    {
+      "variant": "after",
+      "repeat": 3,
+      "workload": "latency",
+      "bytes": 12288,
+      "seconds": 1.0197954420000315,
+      "mbps": 0.09639580248290319,
+      "ttfb_ms_median": 80.928,
+      "cpu_percent": 2.475790630176127
+    }
+  ]
+}

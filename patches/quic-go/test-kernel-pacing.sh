@@ -33,6 +33,10 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
  sleep 0.05
 done
 for binary in "$@"; do
- ip netns exec "$left" env QUIC_KERNEL_PACING_PEER=127.0.0.1 "$binary" -test.run '^TestKernelPacingFQIntegration$' -test.v
+ ip netns exec "$left" env QUIC_KERNEL_PACING_PEER=127.0.0.1 QUIC_KERNEL_PACING_EXPECT_FQ=1 "$binary" -test.run '^TestKernelPacing(FQIntegration|FQPathDetection)$' -test.v
 done
 ip netns exec "$left" tc -s qdisc show dev lo
+ip netns exec "$left" tc qdisc del dev lo root
+for binary in "$@"; do
+ ip netns exec "$left" env QUIC_KERNEL_PACING_PEER=127.0.0.1 QUIC_KERNEL_PACING_EXPECT_FQ=0 "$binary" -test.run '^TestKernelPacingFQPathDetection$' -test.v
+done

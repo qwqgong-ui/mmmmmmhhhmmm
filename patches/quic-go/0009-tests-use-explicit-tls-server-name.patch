@@ -1,0 +1,51 @@
+diff --git a/client_test.go b/client_test.go
+--- a/client_test.go
++++ b/client_test.go
+@@ -16,7 +16,7 @@ func TestDial(t *testing.T) {
+ 		testDial(t,
+ 			func(ctx context.Context, addr net.Addr) error {
+ 				conn := newUDPConnLocalhost(t)
+-				_, err := Dial(ctx, conn, addr, &tls.Config{}, nil)
++				_, err := Dial(ctx, conn, addr, &tls.Config{ServerName: "localhost"}, nil)
+ 				return err
+ 			},
+ 			false,
+@@ -27,7 +27,7 @@ func TestDial(t *testing.T) {
+ 		testDial(t,
+ 			func(ctx context.Context, addr net.Addr) error {
+ 				conn := newUDPConnLocalhost(t)
+-				_, err := DialEarly(ctx, conn, addr, &tls.Config{}, nil)
++				_, err := DialEarly(ctx, conn, addr, &tls.Config{ServerName: "localhost"}, nil)
+ 				return err
+ 			},
+ 			false,
+@@ -37,7 +37,7 @@ func TestDial(t *testing.T) {
+ 		testDial(t,
+ 			func(ctx context.Context, addr net.Addr) error {
+-				_, err := DialAddr(ctx, addr.String(), &tls.Config{}, nil)
++				_, err := DialAddr(ctx, addr.String(), &tls.Config{ServerName: "localhost"}, nil)
+ 				return err
+ 			},
+ 			true,
+ 		)
+@@ -48,7 +48,7 @@ func TestDial(t *testing.T) {
+ 		testDial(t,
+ 			func(ctx context.Context, addr net.Addr) error {
+-				_, err := DialAddrEarly(ctx, addr.String(), &tls.Config{}, nil)
++				_, err := DialAddrEarly(ctx, addr.String(), &tls.Config{ServerName: "localhost"}, nil)
+ 				return err
+ 			},
+ 			true,
+ 		)
+diff --git a/transport_test.go b/transport_test.go
+--- a/transport_test.go
++++ b/transport_test.go
+@@ -143,7 +143,7 @@ func TestTransportAndDialConcurrentClose(t *testing.T) {
+ 	go func() { errChan <- tr.Close() }()
+ 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+ 	defer cancel()
+-	_, err := tr.Dial(ctx, server.LocalAddr(), &tls.Config{}, nil)
++	_, err := tr.Dial(ctx, server.LocalAddr(), &tls.Config{ServerName: "localhost"}, nil)
+ 	require.Error(t, err)
+ 	require.ErrorIs(t, err, ErrTransportClosed)
+ 	require.NotErrorIs(t, err, context.DeadlineExceeded)
