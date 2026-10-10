@@ -17,16 +17,20 @@ const StoreInterval = time.Hour
 const keySep = dev_cache.Separator
 
 var (
-	persistMu     sync.Mutex
-	persistCaches = make(map[string]dnsCache)
-	storeOnce     sync.Once
-	storeMu       sync.Mutex
+	persistMu         sync.Mutex
+	persistCaches     = make(map[string]dnsCache)
+	persistNamespaces = make(map[string]struct{})
+	storeOnce         sync.Once
+	storeMu           sync.Mutex
 )
 
-func registerPersistentCache(name string, c dnsCache) {
+func registerPersistentCache(name string, c dnsCache, namespace ...string) {
 	persistMu.Lock()
 	defer persistMu.Unlock()
 	persistCaches[name] = c
+	if len(namespace) > 0 {
+		persistNamespaces[namespace[0]] = struct{}{}
+	}
 }
 
 func attachDNSCache(name string, c dnsCache) dnsCache {
@@ -42,13 +46,15 @@ func attachDNSCache(name string, c dnsCache) dnsCache {
 func RegisterPersistentCaches(rs Resolvers) {
 	persistMu.Lock()
 	clear(persistCaches)
+	clear(persistNamespaces)
 	persistMu.Unlock()
 	attach := func(role string, r *Resolver) {
 		if r == nil || r.cache == nil {
 			return
 		}
-		r.cache = attachDNSCache("dns/"+r.cacheIdentity+"/"+role, r.cache)
-		registerPersistentCache(role, r.cache)
+		name := "dns/" + r.cacheIdentity + "/" + role
+		r.cache = attachDNSCache(name, r.cache)
+		registerPersistentCache(role, r.cache, name)
 	}
 	attach("main", rs.Resolver)
 	attach("proxy-server", rs.ProxyResolver)
@@ -60,9 +66,53 @@ func RegisterPersistentCaches(rs Resolvers) {
 	attach("direct", direct)
 	for index, c := range direct.sourceCaches {
 		name := fmt.Sprintf("direct-source-%d-%s", index+1, direct.main[index].Address())
-		direct.sourceCaches[index] = attachDNSCache("dns/"+direct.cacheIdentity+"/"+name, c)
-		registerPersistentCache(name, direct.sourceCaches[index])
+		namespace := "dns/" + direct.cacheIdentity + "/" + name
+		direct.sourceCaches[index] = attachDNSCache(namespace, c)
+		registerPersistentCache(name, direct.sourceCaches[index], namespace)
 	}
+}
+
+// Keep unrelated stores (notably TCP winners), and retire only DNS stores that
+// were not reattached by the new configuration. Network branches within a kept
+// store are still reusable until their own 30-day retention period ends. An
+// embedding platform with named network partitions also owns retirement of its
+// network-specific DNS origins: a handover must not discard the previous one.
+func RetainCurrentCaches() int {
+	platformPartitions := dev_cache.PlatformNetworkPartitions() || strings.HasPrefix(dev_cache.CurrentScope(), "environment|")
+	persistMu.Lock()
+	keep := make(map[string]struct{}, len(persistNamespaces)+2)
+	var networkOriginPrefixes []string
+	for name := range persistNamespaces {
+		keep[name] = struct{}{}
+		if platformPartitions {
+			if index := strings.LastIndex(name, "/direct-source-"); index >= 0 {
+				networkOriginPrefixes = append(networkOriginPrefixes, name[:index+len("/direct-source-")])
+			}
+		}
+	}
+	if r := diagnosticServiceResolver; r != nil && r.domainClient != nil && r.domainClient.namespace != "" {
+		keep["domain-bundle/"+r.domainClient.namespace] = struct{}{}
+		keep["domain-record/"+r.domainClient.namespace] = struct{}{}
+	}
+	persistMu.Unlock()
+	removed := dev_cache.RetainNamespaces(func(name string) bool {
+		if !strings.HasPrefix(name, "dns/") && !strings.HasPrefix(name, "domain-bundle/") && !strings.HasPrefix(name, "domain-record/") {
+			return true
+		}
+		_, ok := keep[name]
+		if !ok {
+			for _, prefix := range networkOriginPrefixes {
+				if strings.HasPrefix(name, prefix) {
+					return true
+				}
+			}
+		}
+		return ok
+	})
+	if removed > 0 {
+		log.Fields(log.INFO, map[string]string{"subsystem": "dev_cache", "event": "retired_namespaces", "namespaces": fmt.Sprint(removed)}, "Retired %d obsolete DNS cache namespaces", removed)
+	}
+	return removed
 }
 
 // Load only after C.Path is initialized. Legacy unscoped dnscache records are

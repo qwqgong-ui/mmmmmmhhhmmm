@@ -35,12 +35,13 @@ func domainKey(node, host string) string {
 }
 
 type domainClient struct {
-	public  dnsClient
-	direct  directExchanger
-	bundles *tunneldns.Registry
-	cache   dnsCache
-	records dnsCache
-	prepare func(string) (string, func(context.Context) (net.Conn, error), error)
+	namespace string
+	public    dnsClient
+	direct    directExchanger
+	bundles   *tunneldns.Registry
+	cache     dnsCache
+	records   dnsCache
+	prepare   func(string) (string, func(context.Context) (net.Conn, error), error)
 }
 
 func newDomainClient(public dnsClient, direct directExchanger, size int) *domainClient {

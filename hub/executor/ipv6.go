@@ -278,13 +278,13 @@ func applyRuntimeIPv6AvailabilityLocked(systemAvailable bool) {
 	if active {
 		applyTunIPv6Availability(runtimeIPv6Controller.tun, true)
 		if runtimeIPv6Controller.dns != nil {
-			updateDNS(runtimeIPv6Controller.dns, true)
+			updateDNS(runtimeIPv6Controller.dns, true, false)
 		}
 		resolver.DisableIPv6.Store(false)
 	} else {
 		resolver.DisableIPv6.Store(true)
 		if runtimeIPv6Controller.dns != nil {
-			updateDNS(runtimeIPv6Controller.dns, false)
+			updateDNS(runtimeIPv6Controller.dns, false, false)
 		}
 		applyTunIPv6Availability(runtimeIPv6Controller.tun, false)
 	}

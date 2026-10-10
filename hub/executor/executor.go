@@ -105,7 +105,7 @@ func ApplyConfig(cfg *config.Config, force bool) {
 	updateSniffer(cfg.Sniffer)
 	updateHosts(cfg.Hosts)
 	updateGeneral(cfg.General, true)
-	updateDNS(cfg.DNS, cfg.General.IPv6Active)
+	updateDNS(cfg.DNS, cfg.General.IPv6Active, true)
 	updateNTP(cfg.NTP) // initialize NTP after DNS because an NTP server may be a hostname.
 	updateListeners(cfg.General, cfg.Listeners, force)
 	updateTun(cfg.General) // tun should not care "force"
@@ -238,7 +238,9 @@ func updateNTP(c *config.NTP) {
 	}
 }
 
-func updateDNS(c *config.DNS, generalIPv6 bool) {
+// Namespace retirement belongs to a successful configuration application.
+// Runtime network/IPv6 transitions only rebuild the resolver views.
+func updateDNS(c *config.DNS, generalIPv6 bool, retireObsolete bool) {
 	if !c.Enable {
 		ecs.Setup(false)
 		// Nothing is left to snapshot, and leaving the previous generation
@@ -253,6 +255,11 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 		resolver.DirectHostResolver = nil
 		resolver.BootstrapResolver = nil
 		dns.ReCreateServer("", nil, nil)
+		dns.LoadPersistentCache()
+		if retireObsolete {
+			dns.RetainCurrentCaches()
+			dns.StoreCache()
+		}
 		return
 	}
 
@@ -335,6 +342,12 @@ func updateDNS(c *config.DNS, generalIPv6 bool) {
 	// directory, so the persisted answers are restored here rather than while
 	// the resolvers are being constructed.
 	dns.LoadPersistentCache()
+	if retireObsolete {
+		dns.RetainCurrentCaches()
+		// Persist retirement immediately, including migration of legacy update
+		// clocks, so a restart cannot bring the removed namespaces back.
+		dns.StoreCache()
+	}
 }
 
 func updateHosts(tree *trie.DomainTrie[resolver.HostValue]) {

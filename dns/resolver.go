@@ -572,6 +572,7 @@ func NewFakeIPServiceResolver(defaultServers []NameServer, direct *Resolver, cac
 	if len(identity) > 0 {
 		namespace += "/" + identity[0]
 	}
+	client.namespace = namespace
 	client.cache = attachDNSCache("domain-bundle/"+namespace, client.cache)
 	client.records = attachDNSCache("domain-record/"+namespace, client.records)
 	return &Resolver{

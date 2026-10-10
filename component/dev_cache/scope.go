@@ -11,8 +11,23 @@ const Separator = "\x00"
 
 var scopeState struct {
 	sync.RWMutex
-	environment string
-	desktop     func() string
+	environment        string
+	desktop            func() string
+	platformPartitions bool
+}
+
+// A platform may temporarily have no active network while still remembering
+// Wi-Fi/SIM partitions. Its retirement policy must survive that empty interval.
+func SetPlatformNetworkPartitions(enabled bool) {
+	scopeState.Lock()
+	scopeState.platformPartitions = enabled
+	scopeState.Unlock()
+}
+
+func PlatformNetworkPartitions() bool {
+	scopeState.RLock()
+	defer scopeState.RUnlock()
+	return scopeState.platformPartitions
 }
 
 func SetEnvironment(environment string) {

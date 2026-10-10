@@ -20,6 +20,7 @@ import (
 // switches branches; it deliberately clears nothing, because the scoped keys are
 // what keep one network's long-lived answers from being served on another.
 func SetDirectNetworkEnvironment(environment string) {
+	dev_cache.SetPlatformNetworkPartitions(true)
 	dialer.SetDirectNetworkEnvironment(environment)
 }
 
